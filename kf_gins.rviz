@@ -1,0 +1,48 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Cell Size: 1
+      Plane Cell Count: 10
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Name: KF-GINS Odom
+      Topic: /kf_gins/odom
+      Shape: Arrow
+      Color: 0.0, 1.0, 0.0
+      Axes Length: 1
+      Axes Radius: 0.05
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+      Show Names: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: KF-GINS Path
+      Topic: /kf_gins/path
+      Color: 1.0, 0.0, 0.0
+      Line Style: Lines
+      Line Width: 0.05
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+  Name: root
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 20
+      Focal Point: [0, 0, 0]
+      Pitch: 0.785
+      Yaw: 0.785

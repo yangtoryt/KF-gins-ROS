@@ -1,0 +1,22 @@
+# 忽略ROS2编译生成的目录（根目录下的build/install/log）
+/build/
+/install/
+/log/
+
+# 忽略Python编译产物
+*.pyc
+__pycache__/
+
+# 忽略编辑器/IDE临时文件
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 忽略数据集（如果config/dataset下有大文件）
+# src/kf_gins_node/config/dataset/
+
+# 忽略本地编译产生的二进制文件
+src/**/build/
+src/**/bin/
+src/**/lib/

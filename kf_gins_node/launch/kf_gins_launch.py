@@ -14,7 +14,7 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='kf_gins_node',
-            executable='kf_gins_node',
+            executable='kf_gins_ros2_node',
             name='kf_gins_node',
             parameters=[config],
             output='screen'

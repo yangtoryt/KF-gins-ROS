@@ -87,8 +87,7 @@ public:
     if (this->get_parameter("initpos", v) && v.size() >= 3) {
       options.initstate.pos[0] = v[0] * D2R;
       options.initstate.pos[1] = v[1] * D2R;
-      options.initstate.pos[2] = v[2] * D2R;
-      options.initstate.pos[2] *= R2D; // 与原库的写法保持一致（高度特殊处理）
+      options.initstate.pos[2] = v[2] ;
     }
     if (this->get_parameter("initvel", v) && v.size() >= 3) {
       options.initstate.vel = Eigen::Vector3d(v[0], v[1], v[2]);
@@ -135,6 +134,31 @@ public:
     this->get_parameter("imu_is_increment", imu_is_increment_);
     this->get_parameter("imu_units", imu_units_);
 
+    // Print final resolved imu flags:
+    RCLCPP_INFO(this->get_logger(), "Final imu_is_increment = %s, imu_units = %s",
+                imu_is_increment_ ? "true" : "false", imu_units_.c_str());
+
+
+    // --- Protective sanitize of options before handing to GIEngine ---
+    auto sanitize_vec3 = [](Eigen::Vector3d &v, const Eigen::Vector3d &fallback){
+        for (int i=0;i<3;++i) if (!std::isfinite(v[i])) v[i] = fallback[i];
+    };
+    Eigen::Vector3d zero3 = Eigen::Vector3d::Zero();
+    sanitize_vec3(options.initstate.pos, zero3);
+    sanitize_vec3(options.initstate.vel, zero3);
+    sanitize_vec3(options.initstate.euler, zero3);
+    sanitize_vec3(options.initstate.imuerror.gyrbias, zero3);
+    sanitize_vec3(options.initstate.imuerror.accbias, zero3);
+    sanitize_vec3(options.initstate.imuerror.gyrscale, zero3);
+    sanitize_vec3(options.initstate.imuerror.accscale, zero3);
+
+    // Print them (debug)
+    RCLCPP_INFO(this->get_logger(), "Sanitized initstate pos=%g %g %g", options.initstate.pos[0], options.initstate.pos[1], options.initstate.pos[2]);
+    RCLCPP_INFO(this->get_logger(), "Sanitized initstate vel=%g %g %g", options.initstate.vel[0], options.initstate.vel[1], options.initstate.vel[2]);
+    RCLCPP_INFO(this->get_logger(), "Sanitized initstate euler=%g %g %g (rad)", options.initstate.euler[0], options.initstate.euler[1], options.initstate.euler[2]);
+    RCLCPP_INFO(this->get_logger(), "Sanitized imuerror gyrbias=%g %g %g", options.initstate.imuerror.gyrbias[0], options.initstate.imuerror.gyrbias[1], options.initstate.imuerror.gyrbias[2]);
+
+
     // 打印配置（若库里有这个函数）
     options.print_options();
 
@@ -165,7 +189,7 @@ private:
     return false;
   }
 
-  void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+    void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
     IMU imu_data;
 
     // 时间戳（秒）
@@ -179,12 +203,12 @@ private:
     } else {
       dt = cur_time - last_imu_time_;
       if (!(dt > 0.0) || !std::isfinite(dt)) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "IMU dt invalid: %.9f, fix to %g", dt, 1.0/std::max(1, imudatarate_));
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "IMU dt invalid: %.9f, fallback to %g", dt, 1.0/std::max(1, imudatarate_));
         dt = 1.0 / std::max(1, imudatarate_);
       }
-      // 过大/过小的 dt 也钳一下，避免异常值注入
-      if (dt < 1e-4) dt = 1e-4;
-      if (dt > 0.1)  dt = 0.1;
+      if (dt < 1e-6) dt = 1e-6;
+      if (dt > 0.2) dt = 0.2; // 
     }
     imu_data.dt = dt;
     last_imu_time_ = cur_time;
@@ -197,6 +221,13 @@ private:
     double ay = msg->linear_acceleration.y;
     double az = msg->linear_acceleration.z;
 
+    // 快速检查 ROS 消息字段
+    if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz) ||
+        !std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az)) {
+      RCLCPP_WARN(this->get_logger(), "IMU ROS message contains non-finite values, dropping sample. stamp=%.9f", cur_time);
+      return;
+    }
+
     // 若单位为 "deg_g"，做转换；否则（默认 "si"）不转换
     if (imu_units_ == "deg_g") {
       const double DEG2RAD = M_PI / 180.0;
@@ -205,44 +236,51 @@ private:
       ax *= G2MS2;   ay *= G2MS2;   az *= G2MS2;
     }
 
-    // 检查输入是否有限
-    if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz) ||
-        !std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az)) {
-      RCLCPP_WARN(this->get_logger(), "IMU msg has non-finite values, drop this sample");
-      return;
-    }
-
     // 填充 dtheta / dvel
     if (imu_is_increment_) {
-      // 你的话题就是增量
-      imu_data.dtheta << wx, wy, wz;      // 已经是增量
-      imu_data.dvel   << ax, ay, az;      // 已经是增量
+      imu_data.dtheta << wx, wy, wz;
+      imu_data.dvel   << ax, ay, az;
     } else {
-      // 话题是速率/加速度 → 积分成增量
       imu_data.dtheta << wx * dt, wy * dt, wz * dt;
       imu_data.dvel   << ax * dt, ay * dt, az * dt;
     }
 
-    // 再次检查
+    // 严格检查计算后的增量
     if (!finite3(imu_data.dtheta) || !finite3(imu_data.dvel)) {
-      RCLCPP_ERROR(this->get_logger(), "Computed dtheta/dvel non-finite, drop sample");
+      RCLCPP_ERROR(this->get_logger(), "Computed dtheta/dvel contain non-finite values, drop sample. stamp=%.9f dt=%g", cur_time, dt);
+      RCLCPP_DEBUG(this->get_logger(), "raw wx,wy,wz = %g %g %g; ax,ay,az = %g %g %g", wx, wy, wz, ax, ay, az);
       return;
     }
 
+    // 诊断日志（在 debug 模式下打印）
+    RCLCPP_DEBUG(this->get_logger(), "IMU sample stamp=%.6f dt=%.6g dtheta=[%.8g, %.8g, %.8g] dvel=[%.8g, %.8g, %.8g]",
+                 imu_data.time, imu_data.dt,
+                 imu_data.dtheta.x(), imu_data.dtheta.y(), imu_data.dtheta.z(),
+                 imu_data.dvel.x(), imu_data.dvel.y(), imu_data.dvel.z());
+
     imu_data.odovel = 0.0;
 
-    // 推送到引擎
-    engine_->addImuData(imu_data);
+    // 将 safe 的数据传入 GIEngine
+    if (!engine_) {
+      RCLCPP_ERROR(this->get_logger(), "engine_ is null, cannot process IMU");
+      return;
+    }
+
+    // 再次保护：查阅 GIEngine 内部 imuerror 是否已是 finite
+    // 如果 engine_->debugDump 可用，则可以要求其打印（不用调用在正常路径）
+    engine_->addImuData(imu_data, true); // 传 true 以让引擎在内部补偿偏差（若实现了）
     engine_->newImuProcess();
 
+    // 发布或调试（在 publishState() 中已有检查）
     publishState();
   }
+
 
   void gpsCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
     GNSS gnss_data;
     gnss_data.time = double(msg->header.stamp.sec) + double(msg->header.stamp.nanosec) * 1e-9;
     gnss_data.blh  << msg->latitude, msg->longitude, msg->altitude;
-    gnss_data.std  << 1.0, 1.0, 3.0; // 若有协方差，可从 msg 中取
+    gnss_data.std  << 1.0, 1.0, 3.0; 
     gnss_data.isvalid = std::isfinite(gnss_data.blh.x()) && std::isfinite(gnss_data.blh.y()) && std::isfinite(gnss_data.blh.z());
 
     engine_->addGnssData(gnss_data);

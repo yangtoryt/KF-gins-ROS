@@ -81,6 +81,31 @@ GIEngine::GIEngine(GINSOptions &options) {
         pvacur_.att.cbn   = Rotation::euler2matrix(pvacur_.att.euler);
         pvacur_.att.qbn   = Rotation::euler2quaternion(pvacur_.att.euler);
 
+        // --- 防护：sanitize initstate fields to avoid copying NaN/Inf into internal state ---
+        NavState safe_init = initstate; // copy
+        // sanitize position/velocity/attitude
+        for (int i=0;i<3;++i) {
+            if (!std::isfinite(safe_init.pos[i])) safe_init.pos[i] = 0.0;
+            if (!std::isfinite(safe_init.vel[i])) safe_init.vel[i] = 0.0;
+            if (!std::isfinite(safe_init.euler[i])) safe_init.euler[i] = 0.0;
+        }
+        // sanitize imuerror
+        for (int i=0;i<3;++i) {
+            if (!std::isfinite(safe_init.imuerror.gyrbias[i]))  safe_init.imuerror.gyrbias[i]  = 0.0;
+            if (!std::isfinite(safe_init.imuerror.accbias[i]))  safe_init.imuerror.accbias[i]  = 0.0;
+            if (!std::isfinite(safe_init.imuerror.gyrscale[i])) safe_init.imuerror.gyrscale[i] = 0.0;
+            if (!std::isfinite(safe_init.imuerror.accscale[i])) safe_init.imuerror.accscale[i] = 0.0;
+        }
+        // now use safe_init in place of initstate where appropriate
+        // e.g. replace uses of initstate by safe_init in the next lines, or set imuerror_ from safe_init
+        imuerror_ = safe_init.imuerror;
+        pvacur_.pos       = safe_init.pos;
+        pvacur_.vel       = safe_init.vel;
+        pvacur_.att.euler = safe_init.euler;
+        pvacur_.att.cbn   = Rotation::euler2matrix(pvacur_.att.euler);
+        pvacur_.att.qbn   = Rotation::euler2quaternion(pvacur_.att.euler);
+        // ... and set pvapre_ = pvacur_ below as original code does
+
         // 初始化IMU误差
         imuerror_ = initstate.imuerror;
 
@@ -219,12 +244,15 @@ void GIEngine::imuCompensate(IMU &imu) {
 void GIEngine::insPropagation(IMU &imupre, IMU &imucur) {
 
     // 防御性检查：确保 imucur 有效值（finite），并且 dt 非零
-    if (!std::isfinite(imucur.time) ||
-        !imucur.dtheta.allFinite() ||
-        !imucur.dvel.allFinite()) {
+    if (!std::isfinite(imucur.time) || !imucur.dtheta.allFinite() || !imucur.dvel.allFinite()) {
         std::cerr << "[GIEngine] insPropagation: received non-finite IMU data, skipping propagation\n";
+        std::cerr << "[GIEngine] imucur.time=" << imucur.time << " dtheta=" << imucur.dtheta.transpose()
+                << " dvel=" << imucur.dvel.transpose() << std::endl;
+        std::cerr << "[GIEngine] imupre.time=" << imupre_.time << " dtheta=" << imupre_.dtheta.transpose()
+                << " dvel=" << imupre_.dvel.transpose() << std::endl;
         return;
     }
+
 
     // 防止 dt 为 0 导致除以 0
     double dt = imucur.dt;

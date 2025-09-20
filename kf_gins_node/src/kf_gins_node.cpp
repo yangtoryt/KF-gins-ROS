@@ -14,6 +14,9 @@
 #include <cmath>
 #include <limits>
 
+#include "ament_index_cpp/get_package_share_directory.hpp"
+#include "rclcpp/parameter_events_filter.hpp"
+
 using std::placeholders::_1;
 
 static inline bool finite3(const Eigen::Vector3d &v) {
@@ -24,7 +27,7 @@ class KfGinsNode : public rclcpp::Node {
 public:
   KfGinsNode()
   : Node("kf_gins_ros2_node"), last_imu_time_(-1.0) {
-    // ------------ 参数声明（与你的 YAML 对齐） ------------
+    // ------------ 参数声明（ YAML 对齐） ------------
     this->declare_parameter<std::string>("imupath", "");
     this->declare_parameter<std::string>("gnsspath", "");
     this->declare_parameter<std::string>("outputpath", "");
@@ -54,11 +57,25 @@ public:
     this->declare_parameter<std::vector<double>>("imunoise.asstd",{300.0, 300.0, 300.0});
     this->declare_parameter<double>("imunoise.corrtime", 4.0);
 
+    this->declare_parameter<std::string>("imu_topic", "/imu/data");
+    this->declare_parameter<std::string>("gps_topic", "/gps/fix");  
+
     this->declare_parameter<std::vector<double>>("antlever", {0.0, 0.0, 0.0});
 
     // 新增：IMU 话题是否为增量、IMU 单位
     this->declare_parameter<bool>("imu_is_increment", false); // 默认按 ROS 标准：速率/加速度
     this->declare_parameter<std::string>("imu_units", "si");  // "si" 或 "deg_g"
+
+    #include "ament_index_cpp/get_package_share_directory.hpp"  // 需添加头文件
+
+    // 在参数读取部分添加
+    std::string pkg_path = ament_index_cpp::get_package_share_directory("kf_gins_node");
+    std::string imu_path, gps_path;
+    this->get_parameter("imupath", imu_path);
+    this->get_parameter("gnsspath", gps_path);
+    // 拼接为绝对路径
+    std::string full_imu_path = pkg_path + "/" + imu_path;
+    std::string full_gps_path = pkg_path + "/" + gps_path;
 
     // ------------ 读参数填 options ------------
     GINSOptions options;
@@ -131,6 +148,31 @@ public:
     this->get_parameter("imunoise.corrtime", corr);
     options.imunoise.corr_time = corr;
 
+    // 检查 IMU 频率
+    if (imudatarate <= 0 || imudatarate > 2000) {  // 合理范围限制
+      RCLCPP_ERROR(this->get_logger(), "imudatarate must be 1~2000");
+      rclcpp::shutdown();
+    }
+
+    // 检查初始位置（纬度范围 -90~90，经度 -180~180）
+    if (this->get_parameter("initpos", v) && v.size() >= 2) {
+      if (v[0] < -90 || v[0] > 90 || v[1] < -180 || v[1] > 180) {
+        RCLCPP_ERROR(this->get_logger(), "initpos (lat/lon) out of range");
+        rclcpp::shutdown();
+      }
+    }
+
+    // 检查噪声参数（必须为正数）
+    auto check_positive = [this](const std::vector<double> &v, const std::string &name) {
+      for (double val : v) {
+        if (val <= 0) {
+          RCLCPP_ERROR(this->get_logger(), "%s must be positive", name.c_str());
+          rclcpp::shutdown();
+        }
+      }
+    };
+    if (this->get_parameter("imunoise.arw", v)) check_positive(v, "imunoise.arw");
+
     this->get_parameter("imu_is_increment", imu_is_increment_);
     this->get_parameter("imu_units", imu_units_);
 
@@ -166,12 +208,27 @@ public:
     engine_ = std::make_shared<GIEngine>(options);
 
     // ------------ 订阅与发布 ------------
+    std::string imu_topic = this->get_parameter("imu_topic").as_string();
     imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-      "/imu/data", rclcpp::SensorDataQoS(),
-      std::bind(&KfGinsNode::imuCallback, this, _1));
+      imu_topic, rclcpp::SensorDataQoS(),
+      std::bind(&KfGinsNode::imuCallback, this, _1)
+    );
 
+    std::string gps_topic = this->get_parameter("gps_topic").as_string();
     gps_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-      "/gps/fix", 10, std::bind(&KfGinsNode::gpsCallback, this, _1));
+      gps_topic, 10, std::bind(&KfGinsNode::gpsCallback, this, _1)
+    );
+
+    auto param_callback = [this](const std::vector<rclcpp::Parameter> &params) {
+      for (const auto &param : params) {
+        if (param.get_name() == "imu_units") {
+          imu_units_ = param.as_string();
+          RCLCPP_INFO(this->get_logger(), "Updated imu_units to %s", imu_units_.c_str());
+        }
+      }
+      return rcl_interfaces::msg::SetParametersResult{true, ""};
+    };
+    param_sub_ = this->add_on_set_parameters_callback(param_callback);
 
     odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/kf_gins/odom", 10);
 
@@ -188,6 +245,13 @@ private:
     }
     return false;
   }
+
+    /**
+     * @brief 处理IMU消息回调
+     * 1. 转换ROS消息为内部IMU格式
+     * 2. 处理时间戳和采样周期（异常值替换为默认值）
+     * 3. 根据 imu_is_increment 和 imu_units 转换数据单位
+     */
 
     void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
     IMU imu_data;
@@ -286,6 +350,7 @@ private:
     engine_->addGnssData(gnss_data);
     publishState();
   }
+  
 
   void publishState() {
     NavState state = engine_->getNavState();
@@ -324,6 +389,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  rclcpp::Node::OnSetParametersCallbackHandle::SharedPtr param_sub_;
 
   double last_imu_time_;
   bool   imu_is_increment_{false};

@@ -1,7 +1,7 @@
 kf_gins_ros2_node:
   ros__parameters:
-    imupath: "/home/yang/KF-ROS/ros_ws/src/kf_gins_node/config/dataset/Leador-A15.txt"
-    gnsspath: "/home/yang/KF-ROS/ros_ws/src/kf_gins_node/config/dataset/GNSS-RTK.txt"
+    imupath: "config/dataset/Leador-A15.txt"
+    gnsspath: "config/dataset/GNSS-RTK.txt"
 
     outputpath: "/home/yang/KF-ROS/ros_ws/src/kf_gins_node/config/dataset"
 
@@ -35,5 +35,5 @@ kf_gins_ros2_node:
 
       antlever: [0.136, -0.301, -0.184]
 
-    imu_is_increment: true   # 必须改成 false
+    imu_is_increment: true   
     imu_units: "si"

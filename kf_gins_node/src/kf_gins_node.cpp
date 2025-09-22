@@ -63,10 +63,8 @@ public:
     this->declare_parameter<std::vector<double>>("antlever", {0.0, 0.0, 0.0});
 
     // 新增：IMU 话题是否为增量、IMU 单位
-    this->declare_parameter<bool>("imu_is_increment", false); // 默认按 ROS 标准：速率/加速度
+    this->declare_parameter<bool>("imu_is_increment", true); // 默认按 ROS 标准：速率/加速度
     this->declare_parameter<std::string>("imu_units", "si");  // "si" 或 "deg_g"
-
-    #include "ament_index_cpp/get_package_share_directory.hpp"  // 需添加头文件
 
     // 在参数读取部分添加
     std::string pkg_path = ament_index_cpp::get_package_share_directory("kf_gins_node");
@@ -173,8 +171,12 @@ public:
     };
     if (this->get_parameter("imunoise.arw", v)) check_positive(v, "imunoise.arw");
 
-    this->get_parameter("imu_is_increment", imu_is_increment_);
+    this->get_parameter("imu_is_increment", imu_is_increment_ = true);
     this->get_parameter("imu_units", imu_units_);
+
+    // 在打印 "Final imu_is_increment = ..." 之前添加
+    RCLCPP_INFO(this->get_logger(), "Loaded imu_is_increment from config: %s", 
+                this->get_parameter("imu_is_increment").as_bool() ? "true" : "false");
 
     // Print final resolved imu flags:
     RCLCPP_INFO(this->get_logger(), "Final imu_is_increment = %s, imu_units = %s",
@@ -219,14 +221,13 @@ public:
       gps_topic, 10, std::bind(&KfGinsNode::gpsCallback, this, _1)
     );
 
+
     auto param_callback = [this](const std::vector<rclcpp::Parameter> &params) {
-      for (const auto &param : params) {
-        if (param.get_name() == "imu_units") {
-          imu_units_ = param.as_string();
-          RCLCPP_INFO(this->get_logger(), "Updated imu_units to %s", imu_units_.c_str());
-        }
-      }
-      return rcl_interfaces::msg::SetParametersResult{true, ""};
+      rcl_interfaces::msg::SetParametersResult result;  // 显式创建实例
+      result.successful = true;  // 设置"成功"标志
+      result.reason = "";        // 可选：设置原因（空字符串表示无错误）
+      // ... 其他参数处理逻辑（如果有）...
+      return result;  // 返回实例
     };
     param_sub_ = this->add_on_set_parameters_callback(param_callback);
 

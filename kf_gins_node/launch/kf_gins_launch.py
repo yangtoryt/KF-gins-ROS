@@ -17,6 +17,7 @@ def generate_launch_description():
             executable='kf_gins_ros2_node',
             name='kf_gins_node',
             parameters=[config],
-            output='screen'
+            output='screen',
+            arguments=['--log-level', 'kf_gins_node:info']
         )
     ])

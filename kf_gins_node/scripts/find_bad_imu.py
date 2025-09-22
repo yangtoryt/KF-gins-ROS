@@ -41,11 +41,10 @@ class Checker(Node):
         if self.count >= 2000 or (time.time() - self.start) > 20.0:
             self.get_logger().info(f'finished: total={self.count} bad={self.bad}')
             rclpy.shutdown()
-
-    def main():
+def main():
         rclpy.init()
         node = Checker()
         rclpy.spin(node)
 
-    if __name__ == '__main__':
+if __name__ == '__main__':
         main()

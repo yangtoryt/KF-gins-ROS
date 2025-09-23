@@ -81,6 +81,7 @@ install(PROGRAMS
   scripts/find_bad_imu.py 
   scripts/imu_check.py 
   scripts/imu_echo.py
+  config/dataset/check_time_range.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

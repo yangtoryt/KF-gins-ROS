@@ -179,6 +179,13 @@ void INSMech::attUpdate(const PVA &pvapre, PVA &pvacur, const IMU &imupre, const
     // b-frame rotation vector (b(k) with respect to b(k-1)-frame)
     // compensate the second-order coning correction term.
     temp1 = imucur.dtheta + imupre.dtheta.cross(imucur.dtheta) / 12;
+    double rot_norm = temp1.norm();  // 计算模长
+    std::cout << "[DEBUG] 旋转向量模长: " << rot_norm << " (rad)" << std::endl;
+    // 若模长超过π，强制归一化
+    if (rot_norm > M_PI) {
+        temp1 = temp1.normalized() * (rot_norm - 2*M_PI);
+        std::cout << "[FIX] 旋转向量模长超过π，已修正为: " << temp1.norm() << std::endl;
+    }
     qbb   = Rotation::rotvec2quaternion(temp1);
 
     // 姿态更新完成

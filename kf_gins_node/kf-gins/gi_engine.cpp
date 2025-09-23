@@ -417,6 +417,7 @@ void GIEngine::insPropagation(IMU &imupre, IMU &imucur)
     // compute system propagation noise
     Qd = G * Qc_ * G.transpose() * dt;
     Qd = (Phi * Qd * Phi.transpose() + Qd) / 2;
+    std::cout << "[DEBUG] Qd 对角线: " << Qd.diagonal().transpose() << std::endl;
 
     // EKF预测传播系统协方差和系统误差状态
     // do EKF predict to propagate covariance and error state
@@ -503,6 +504,11 @@ void GIEngine::EKFPredict(Eigen::MatrixXd &Phi, Eigen::MatrixXd &Qd)
     {
         // 若 dx_ 尺寸不匹配，重置为 0
         dx_.setZero(Cov_.rows(), 1);
+    }
+    double max_cov = 1e6;
+    for (int i = 0; i < Cov_.rows(); ++i) {
+        if (Cov_(i, i) > max_cov) Cov_(i, i) = max_cov;
+        if (Cov_(i, i) < 1e-9) Cov_(i, i) = 1e-9; // 避免零或负值
     }
 }
 

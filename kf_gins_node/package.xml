@@ -4,7 +4,7 @@
   <version>0.0.1</version>
   <description>KF-GINS ROS2 Node</description>
   <maintainer email="3306352477@qq.com">yangtoryt</maintainer>
-  <license>MIT</license>
+  <license>GPLv3</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 

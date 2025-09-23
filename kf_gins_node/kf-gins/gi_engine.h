@@ -220,11 +220,20 @@ private:
      *        Check if covariance diagonal elements are all positive
      * */
     void checkCov() {
-
         for (int i = 0; i < RANK; i++) {
-            if (Cov_(i, i) < 0) {
-                std::cout << "Covariance is negative at " << std::setprecision(10) << timestamp_ << " !" << std::endl;
+            if (std::isnan(Cov_(i, i)) || std::isinf(Cov_(i, i))) {
+                std::cout << "[ERROR] 协方差异常（NaN/无穷大）: 索引 " << i << std::endl;
+                // 打印相邻元素辅助定位
+                if (i > 0) std::cout << "  前序元素: " << Cov_(i-1, i-1) << std::endl;
                 std::exit(EXIT_FAILURE);
+            }
+            if (Cov_(i, i) < -1e-6) {  // 允许微小负值（浮点误差）
+                std::cout << "[ERROR] 协方差为负: 索引 " << i << " = " << Cov_(i,i) << std::endl;
+                std::exit(EXIT_FAILURE);
+            }
+            // 检查是否过大（如超过1e6，根据实际场景调整）
+            if (Cov_(i, i) > 1e6) {
+                std::cout << "[WARN] 协方差过大: 索引 " << i << " = " << Cov_(i,i) << std::endl;
             }
         }
     }

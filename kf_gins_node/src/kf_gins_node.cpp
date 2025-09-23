@@ -103,7 +103,9 @@ public:
       options.initstate.pos[0] = v[0] * D2R;
       options.initstate.pos[1] = v[1] * D2R;
       options.initstate.pos[2] = v[2] ;
-    }
+    }else {
+  RCLCPP_ERROR(this->get_logger(), "Failed to load initpos");
+}
     if (this->get_parameter("initvel", v) && v.size() >= 3) {
       options.initstate.vel = Eigen::Vector3d(v[0], v[1], v[2]);
     }
@@ -129,19 +131,44 @@ public:
     if (this->get_parameter("antlever", v) && v.size() >= 3) {
       options.antlever = Eigen::Vector3d(v[0], v[1], v[2]);
     }
-
+    // 定义转换因子：1 °/√h = π/(180×√3600) rad/√s
+    const double DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC = M_PI / 180.0 / sqrt(3600.0);
     if (this->get_parameter("imunoise.arw", v) && v.size() >= 3)
-      options.imunoise.gyr_arw = Eigen::Vector3d(v[0], v[1], v[2]);
+      options.imunoise.gyr_arw = Eigen::Vector3d(
+        v[0] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC,
+        v[1] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC,
+        v[2] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC
+      );
+    // 定义转换因子：1 m/s/√h = 1/√3600 m/s/√s
+    const double MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC = 1.0 / sqrt(3600.0);
     if (this->get_parameter("imunoise.vrw", v) && v.size() >= 3)
-      options.imunoise.acc_vrw = Eigen::Vector3d(v[0], v[1], v[2]);
+      options.imunoise.acc_vrw = Eigen::Vector3d(
+        v[0] * MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC,
+        v[1] * MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC,
+        v[2] * MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC
+      );
+    // 定义转换因子：1 °/h = π/(180×3600) rad/s
+    const double DEG_PER_HOUR_TO_RAD_PER_SEC = M_PI / 180.0 / 3600.0;
     if (this->get_parameter("imunoise.gbstd", v) && v.size() >= 3)
-      options.imunoise.gyrbias_std = Eigen::Vector3d(v[0], v[1], v[2]);
+      options.imunoise.gyrbias_std = Eigen::Vector3d(
+        v[0] * DEG_PER_HOUR_TO_RAD_PER_SEC,
+        v[1] * DEG_PER_HOUR_TO_RAD_PER_SEC,
+        v[2] * DEG_PER_HOUR_TO_RAD_PER_SEC
+      );
+    // 定义转换因子：1 mGal = 1e-5 m/s²
+    const double MILLIGAL_TO_MPS2 = 1e-5;
     if (this->get_parameter("imunoise.abstd", v) && v.size() >= 3)
-      options.imunoise.accbias_std = Eigen::Vector3d(v[0], v[1], v[2]);
+      options.imunoise.accbias_std = Eigen::Vector3d(
+        v[0] * MILLIGAL_TO_MPS2,
+        v[1] * MILLIGAL_TO_MPS2,
+        v[2] * MILLIGAL_TO_MPS2
+      );
+    
     if (this->get_parameter("imunoise.gsstd", v) && v.size() >= 3)
       options.imunoise.gyrscale_std = Eigen::Vector3d(v[0], v[1], v[2]);
     if (this->get_parameter("imunoise.asstd", v) && v.size() >= 3)
       options.imunoise.accscale_std = Eigen::Vector3d(v[0], v[1], v[2]);
+
     double corr = 4.0;
     this->get_parameter("imunoise.corrtime", corr);
     options.imunoise.corr_time = corr;

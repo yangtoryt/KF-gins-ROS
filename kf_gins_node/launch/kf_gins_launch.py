@@ -15,7 +15,7 @@ def generate_launch_description():
         Node(
             package='kf_gins_node',
             executable='kf_gins_ros2_node',
-            name='kf_gins_node',
+            name='kf_gins_ros2_node',
             parameters=[config],
             output='screen',
             arguments=['--log-level', 'kf_gins_node:info']

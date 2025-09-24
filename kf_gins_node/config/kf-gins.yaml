@@ -8,7 +8,7 @@ kf_gins_ros2_node:
     imudatalen: 7
     imudatarate: 200
 
-    starttime: 456250.00439453
+    starttime: 456293.0
     endtime: -1.0
 
     initpos: [30.4447873701, 114.4718632047, 20.899]
@@ -33,7 +33,7 @@ kf_gins_ros2_node:
       asstd: [0.0005, 0.0005, 0.0005]
       corrtime: 4.0
 
-      antlever: [0.136, -0.301, -0.184]
+    antlever: [0.136, -0.301, -0.184]
 
-    imu_is_increment: true   
+    imu_is_increment: false  
     imu_units: "si"

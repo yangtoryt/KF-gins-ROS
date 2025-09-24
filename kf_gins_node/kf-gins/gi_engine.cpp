@@ -7,7 +7,7 @@
 
 #include <iostream>
 #include <iomanip>
-#include <algorithm> // std::min 保底
+#include <algorithm> // std::min/std::max 保底（注意：std::clamp 需要 C++17）
 #include <cmath>
 #include <limits>
 
@@ -336,6 +336,40 @@ void GIEngine::insPropagation(IMU &imupre, IMU &imucur)
     accel = imucur.dvel / dt;
     omega = imucur.dtheta / dt;
 
+        // ====== start: IMU sanity checks & clamp ======
+    auto clamp_val = [](double v, double minv, double maxv) {
+        if (!std::isfinite(v)) return minv;
+        if (v < minv) return minv;
+        if (v > maxv) return maxv;
+        return v;
+    };
+
+    // 最大允许的瞬时角速度/加速度（经验值），避免单帧极端值破坏滤波器
+    const double MAX_ANG_RATE = 200.0;    // rad/s (非常大，不会误截正常数据)
+    const double MAX_ACCEL    = 200.0;    // m/s^2 (非常大)
+
+    // 检查 omega/accel 的每个分量是否为有限值并在合理范围内
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(omega[i]) || std::abs(omega[i]) > 1e8) {
+            std::cerr << "[GIEngine] WARNING: omega invalid at time " << imucur.time << " idx " << i
+                      << " value=" << omega[i] << " -> clamped\n";
+            omega[i] = clamp_val(omega[i], -MAX_ANG_RATE, MAX_ANG_RATE);
+        }
+        if (!std::isfinite(accel[i]) || std::abs(accel[i]) > 1e8) {
+            std::cerr << "[GIEngine] WARNING: accel invalid at time " << imucur.time << " idx " << i
+                      << " value=" << accel[i] << " -> clamped\n";
+            accel[i] = clamp_val(accel[i], -MAX_ACCEL, MAX_ACCEL);
+        }
+    }
+
+    // 如果发现 dt 异常（例如太小或为 NaN），打印详细信息
+    if (!std::isfinite(dt) || dt <= 1e-9) {
+        std::cerr << "[GIEngine] WARNING: fallback dt used, original dt=" << imucur.dt
+                  << " imucur.time=" << imucur.time << "\n";
+    }
+    // ====== end: IMU sanity checks & clamp ======
+
+
     // 位置误差
     // position error
     temp.setZero();
@@ -417,7 +451,34 @@ void GIEngine::insPropagation(IMU &imupre, IMU &imucur)
     // compute system propagation noise
     Qd = G * Qc_ * G.transpose() * dt;
     Qd = (Phi * Qd * Phi.transpose() + Qd) / 2;
+    // ====== start: Qd sanity & clamp ======
+    bool qbad = false;
+    for (int i = 0; i < Qd.rows(); ++i) {
+        double v = Qd(i,i);
+        if (!std::isfinite(v) || v <= 0.0) {
+            qbad = true;
+            break;
+        }
+    }
+    if (qbad) {
+        std::cerr << "[GIEngine] ERROR: Qd has invalid entries at imucur.time=" << imucur.time << "\n";
+        std::cerr << "[GIEngine] imucur.time=" << imucur.time << " dtheta=" << imucur.dtheta.transpose()
+                  << " dvel=" << imucur.dvel.transpose() << " dt=" << dt << "\n";
+        std::cerr << "[GIEngine] Qd diag (raw): " << Qd.diagonal().transpose() << "\n";
+        // 对角线逐元素修正为最小正值，避免NaN/Inf传播
+        for (int i = 0; i < Qd.rows(); ++i) {
+            double v = Qd(i,i);
+            if (!std::isfinite(v) || v <= 0.0) Qd(i,i) = 1e-18;
+        }
+    }
+    // 最终再做一个 clamp：防止某些分量太大
+    for (int i = 0; i < Qd.rows(); ++i) {
+        double v = Qd(i,i);
+        if (v > 1e18) Qd(i,i) = 1e18;
+        if (v < 1e-18) Qd(i,i) = 1e-18;
+    }
     std::cout << "[DEBUG] Qd 对角线: " << Qd.diagonal().transpose() << std::endl;
+    // ====== end: Qd sanity & clamp ======
 
     // EKF预测传播系统协方差和系统误差状态
     // do EKF predict to propagate covariance and error state
@@ -492,6 +553,23 @@ void GIEngine::EKFPredict(Eigen::MatrixXd &Phi, Eigen::MatrixXd &Qd)
         return;
     }
 
+    // before computing Cov_ = Phi * Cov_ * Phi^T + Qd
+    if (!Phi.allFinite()) {
+        std::cerr << "[GIEngine] EKFPredict: Phi contains non-finite entries. Resetting Phi to Identity.\n";
+        Phi.setIdentity();
+    }
+    if (!Cov_.allFinite()) {
+        std::cerr << "[GIEngine] EKFPredict: Cov_ contains non-finite entries. Resetting Cov_ to small diag.\n";
+        Cov_.setZero();
+        Cov_.diagonal().setConstant(1e-6);
+    }
+    if (!Qd.allFinite()) {
+        std::cerr << "[GIEngine] EKFPredict: Qd contains non-finite entries. Replacing with small diag.\n";
+        Qd.setZero();
+        Qd.diagonal().setConstant(1e-18);
+    }
+
+
     // Cov_ = Phi * Cov_ * Phi^T + Qd
     Cov_ = Phi * Cov_ * Phi.transpose() + Qd;
 
@@ -548,7 +626,16 @@ void GIEngine::EKFUpdate(Eigen::MatrixXd &dz, Eigen::MatrixXd &H, Eigen::MatrixX
     // 更新 dx_ 和 Cov_
     if (dx_.rows() == Cov_.rows() && dx_.cols() == 1)
     {
-        dx_ = dx_ + K * (dz - H * dx_);
+        // 防止 dx_ 单次更新过大：做简单阈值保护
+        Eigen::VectorXd innovation = dz - H * dx_;
+        Eigen::VectorXd tentative = K * innovation;
+        double max_allowed = 1e6; // 一个非常大的阈值，依据需要可调整
+        double max_elem = tentative.cwiseAbs().maxCoeff();
+        if (std::isfinite(max_elem) && max_elem > max_allowed) {
+            std::cerr << "[GIEngine] EKFUpdate: dx_ too large (max=" << max_elem << ") -> clamping to " << max_allowed << std::endl;
+            tentative = tentative.array().unaryExpr([&](double v){ return (v>0?std::min(v, max_allowed):std::max(v, -max_allowed)); });
+        }
+        dx_ = dx_ + tentative;
     }
     else
     {
@@ -578,19 +665,40 @@ void GIEngine::stateFeedback()
 
     // 姿态误差反馈 (用小旋转向量 -> 四元数)
     Eigen::Vector3d dphi = dx_.block(PHI_ID, 0, 3, 1);
-    Eigen::Quaterniond qpn = Rotation::rotvec2quaternion(dphi);
-    pvacur_.att.qbn = qpn * pvacur_.att.qbn;
-    pvacur_.att.cbn = Rotation::quaternion2matrix(pvacur_.att.qbn);
-    pvacur_.att.euler = Rotation::matrix2euler(pvacur_.att.cbn);
+
+    // 如果角度误差过大则跳过姿态反馈（保护性）
+    double dphi_norm = dphi.norm();
+    if (!std::isfinite(dphi_norm) || dphi_norm > 1.0) { // 1 rad ~= 57 deg 是很大的阈值，可根据需要调整
+        std::cerr << "[GIEngine] stateFeedback: dphi invalid or too large (norm=" << dphi_norm << ") -> skipping attitude feedback\n";
+    } else {
+        Eigen::Quaterniond qpn = Rotation::rotvec2quaternion(dphi);
+        pvacur_.att.qbn = qpn * pvacur_.att.qbn;
+        pvacur_.att.cbn = Rotation::quaternion2matrix(pvacur_.att.qbn);
+        pvacur_.att.euler = Rotation::matrix2euler(pvacur_.att.cbn);
+    }
 
     // IMU 零偏与比例因子误差反馈
     Eigen::Vector3d dbg = dx_.block(BG_ID, 0, 3, 1);
-    imuerror_.gyrbias += dbg;
     Eigen::Vector3d dba = dx_.block(BA_ID, 0, 3, 1);
-    imuerror_.accbias += dba;
     Eigen::Vector3d dsg = dx_.block(SG_ID, 0, 3, 1);
-    imuerror_.gyrscale += dsg;
     Eigen::Vector3d dsa = dx_.block(SA_ID, 0, 3, 1);
+
+    // 保护性阈值，避免单次反馈将误差推到巨大的值
+    const double GYRB_MAX = 1e3;   // deg/h 量级根据实际调整
+    const double ACCB_MAX = 1e3;   // mGal 量级
+    const double SCALE_MAX = 1e6;  // ppm 量级（非常大，防止溢出）
+
+    for (int i = 0; i < 3; ++i) {
+        // 使用 std::min/std::max 代替 std::clamp（兼容更老编译器）
+        dbg[i] = std::max(-GYRB_MAX, std::min(dbg[i], GYRB_MAX));
+        dba[i] = std::max(-ACCB_MAX, std::min(dba[i], ACCB_MAX));
+        dsg[i] = std::max(-SCALE_MAX, std::min(dsg[i], SCALE_MAX));
+        dsa[i] = std::max(-SCALE_MAX, std::min(dsa[i], SCALE_MAX));
+    }
+
+    imuerror_.gyrbias += dbg;
+    imuerror_.accbias += dba;
+    imuerror_.gyrscale += dsg;
     imuerror_.accscale += dsa;
 
     // 反馈后清零 dx_

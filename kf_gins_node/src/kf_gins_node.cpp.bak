@@ -1,6 +1,5 @@
-// src/kf_gins_node.cpp (robust version with additional safety logging and stronger Z clamp)
+// src/kf_gins_node.cpp (robust version with TF broadcaster, Path publish, and coord auto-detect)
 // Prioritize path z and clamp odom/tf z to avoid huge vertical teleports that ruin RViz view.
-// Added: more verbose debug prints and a final hard-clamp on z to avoid publishing absurd heights.
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -18,6 +17,7 @@
 #include <string>
 #include <cmath>
 #include <limits>
+#include <algorithm>
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "rclcpp/parameter_events_filter.hpp"
@@ -57,7 +57,7 @@ static Eigen::Matrix3d ecefToEnuRot(double lat0, double lon0) {
 class KfGinsNode : public rclcpp::Node {
 public:
   KfGinsNode()
-  : Node("kf_gins_ros2_node"), last_imu_time_(-1.0), have_last_quat_(false) {
+  : Node("kf_gins_ros2_node"), last_imu_time_(-1.0) {
     // ------------ 参数声明（ YAML 对齐） ------------
     this->declare_parameter<std::string>("imupath", "");
     this->declare_parameter<std::string>("gnsspath", "");
@@ -96,9 +96,6 @@ public:
     // 新增：IMU 话题是否为增量、IMU 单位
     this->declare_parameter<bool>("imu_is_increment", true); // 默认按 ROS 标准：速率/加速度
     this->declare_parameter<std::string>("imu_units", "si");  // "si" 或 "deg_g"
-
-    // 可调：四元数平滑强度（new_weight，0..1, 0: 全部用旧，1: 全部用新）
-    this->declare_parameter<double>("orientation_slerp_alpha", 0.2);
 
     std::string pkg_path = ament_index_cpp::get_package_share_directory("kf_gins_node");
     std::string imu_path, gps_path;
@@ -225,12 +222,11 @@ public:
 
     this->get_parameter("imu_is_increment", imu_is_increment_);
     this->get_parameter("imu_units", imu_units_);
-    this->get_parameter("orientation_slerp_alpha", orientation_slerp_alpha_);
 
     RCLCPP_INFO(this->get_logger(), "Loaded imu_is_increment from config: %s",
                 imu_is_increment_ ? "true" : "false");
-    RCLCPP_INFO(this->get_logger(), "Final imu_is_increment = %s, imu_units = %s, slerp_alpha=%.3f",
-                imu_is_increment_ ? "true" : "false", imu_units_.c_str(), orientation_slerp_alpha_);
+    RCLCPP_INFO(this->get_logger(), "Final imu_is_increment = %s, imu_units = %s",
+                imu_is_increment_ ? "true" : "false", imu_units_.c_str());
 
     auto sanitize_vec3 = [](Eigen::Vector3d &v, const Eigen::Vector3d &fallback){
         for (int i=0;i<3;++i) if (!std::isfinite(v[i])) v[i] = fallback[i];
@@ -410,9 +406,6 @@ private:
     bool converted = false;
     std::string detected = "unknown";
 
-    // Print raw state.pos for diagnostics
-    RCLCPP_DEBUG(this->get_logger(), "Raw state.pos = [%.12g, %.12g, %.12g]", state.pos[0], state.pos[1], state.pos[2]);
-
     if (std::isfinite(state.pos[0]) && std::isfinite(state.pos[1]) && std::isfinite(state.pos[2])) {
       double ax = std::abs(state.pos[0]), ay = std::abs(state.pos[1]), az = std::abs(state.pos[2]);
       if (ax < 1e5 && ay < 1e5 && az < 2e4) {
@@ -470,14 +463,10 @@ private:
     const double MAX_ACCEPT = 5e5; // 500 km guard
     const double MAX_ALT_DELTA = 2000.0; // +/- 2000 m allowed relative to init altitude
     const double SMOOTH_Z_DELTA = 50.0; // smoothing step if needed
-    const double MAX_MATCH_Z_DIFF = 100.0; // if pub_pos.z differs from path_z by > this, clamp to path_z
+    // const double MAX_MATCH_Z_DIFF = 100.0; // if pub_pos.z differs from path_z by > this, clamp to path_z
 
     double init_alt = init_blh_rad_.z(); // initial altitude (meters)
     bool publish_raw = true;
-
-    // Log detection result
-    RCLCPP_DEBUG(this->get_logger(), "Detected pos format=%s converted=%d pub_pos(before clamp)=[%.6f, %.6f, %.6f] init_alt=%.3f",
-                 detected.c_str(), converted?1:0, pub_pos.x(), pub_pos.y(), pub_pos.z(), init_alt);
 
     if (!converted) {
       publish_raw = false;
@@ -486,12 +475,10 @@ private:
       if (!finite3(pub_pos) ||
           std::abs(pub_pos.x()) > MAX_ACCEPT || std::abs(pub_pos.y()) > MAX_ACCEPT ||
           std::abs(pub_pos.z() - init_alt) > MAX_ALT_DELTA) {
-        // If pub_pos is out of acceptable bounds, try alternate detection: maybe the z is actually altitude offset vs init?
+        publish_raw = false;
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "publishState: converted pub_pos out of bounds (detected=%s) -> pub_pos=(%.6f,%.6f,%.6f) init_alt=%.3f",
+          "publishState: converted pub_pos out of bounds (detected=%s) -> will fallback. pub_pos=(%.3f,%.3f,%.3f) init_alt=%.3f",
           detected.c_str(), pub_pos.x(), pub_pos.y(), pub_pos.z(), init_alt);
-        publish_raw = true; // still publish but force strong z clamp below (to avoid whole fallback)
-        // we don't immediately set used_fallback true — we try to salvage XY and clamp Z
       }
     }
 
@@ -508,11 +495,9 @@ private:
       if (have_last_valid_) {
         pub_pos = last_valid_enu_;
         used_fallback = true;
-        RCLCPP_DEBUG(this->get_logger(), "publishState: using last_valid_enu as fallback [%g,%g,%g]", pub_pos.x(), pub_pos.y(), pub_pos.z());
       } else {
         pub_pos = Eigen::Vector3d::Zero();
         used_fallback = true;
-        RCLCPP_DEBUG(this->get_logger(), "publishState: no last valid -> publishing Zero fallback");
       }
     } else {
       // If we have last valid and z jump is big, do smoothing step to avoid teleport
@@ -528,25 +513,25 @@ private:
           pub_pos.z() = newz;
         }
       }
-      // enforce path z if path exists
-      if (!path_msg_.poses.empty()) {
-        double dzp = pub_pos.z() - reference_z;
-        if (std::abs(dzp) > MAX_MATCH_Z_DIFF) {
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Enforcing path-based z clamp: pub_z=%.3f path_z=%.3f diff=%.3f -> setting pub_z to path_z",
-            pub_pos.z(), reference_z, dzp);
-          pub_pos.z() = reference_z;
-        }
-      }
 
-      // *** FINAL HARD SANITY: 如果高度仍然异常（绝对值超大或离 init_alt 过远），强制设置为 reference_z 或 init_alt ***
-      if (!std::isfinite(pub_pos.z()) || std::abs(pub_pos.z()) > 1e4 || std::abs(pub_pos.z() - init_alt) > MAX_ALT_DELTA) {
-        double final_z = init_alt;
-        if (!path_msg_.poses.empty()) final_z = reference_z;
-        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "Final safety clamp: pub_pos.z=%g out-of-bounds -> forcing pub_pos.z=%g (init_alt=%g ref_z=%g)",
-          pub_pos.z(), final_z, init_alt, reference_z);
-        pub_pos.z() = final_z;
+      // ---- NEW STRATEGY: always prefer path z if path exists ----
+      // This enforces odom/z and tf/z to match the path shown in RViz and avoids one-source-high/other-source-low mismatch.
+      if (!path_msg_.poses.empty()) {
+        double oldz = pub_pos.z();
+        pub_pos.z() = reference_z;
+        if (std::abs(pub_pos.z() - oldz) > 0.5) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Overriding pub_pos.z (%.3f) with latest path z (%.3f) to keep odom/tf/path consistent.",
+            oldz, pub_pos.z());
+        }
+      } else {
+        // clamp absolute extreme z to safe band around init_alt just in case
+        if (std::abs(pub_pos.z() - init_alt) > MAX_ALT_DELTA) {
+          double clamped = init_alt + std::copysign(MAX_ALT_DELTA, pub_pos.z() - init_alt);
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Clamping pub_pos.z from %.3f to safe band %.3f (init_alt=%.3f)", pub_pos.z(), clamped, init_alt);
+          pub_pos.z() = clamped;
+        }
       }
 
       // accept as "last valid"
@@ -554,107 +539,7 @@ private:
       have_last_valid_ = true;
     }
 
-    // Log final publish position
-    RCLCPP_DEBUG(this->get_logger(), "Final pub_pos = [%.6f, %.6f, %.6f] (used_fallback=%d)", pub_pos.x(), pub_pos.y(), pub_pos.z(), used_fallback?1:0);
-
-        // ==========================
-    // Compose + safety-guarded publish (Replace original odom/tf/path block)
-    // ==========================
-    // euler -> quaternion
-    Eigen::AngleAxisd rx(state.euler(0), Eigen::Vector3d::UnitX());
-    Eigen::AngleAxisd ry(state.euler(1), Eigen::Vector3d::UnitY());
-    Eigen::AngleAxisd rz(state.euler(2), Eigen::Vector3d::UnitZ());
-    Eigen::Quaterniond q = rz * ry * rx;
-    if (q.norm() <= 0.0) q = Eigen::Quaterniond::Identity();
-    else q.normalize();
-
-    // Strong protection thresholds (可按需调节)
-    const double ABS_MAX_COMPONENT = 1.0e7;   // 若 state.pos 任一分量超此值，认为异常
-    const double ABS_MAX_PUBPOS_Z   = 1.0e5;  // 若转换后 pub_pos.z 超此值，认为异常（100 km）
-    const double MAX_ACCEPT_XY = 5e5;         // 与之前逻辑一致的最大 XY 可接受值
-    bool suppress_tf_and_path = false;
-
-    // Extra checks on raw state.pos before trusting conversions
-    bool abnormal_raw_state = false;
-    for (int i=0;i<3;++i) {
-      if (!std::isfinite(state.pos[i])) { abnormal_raw_state = true; break; }
-      if (std::abs(state.pos[i]) > ABS_MAX_COMPONENT) { abnormal_raw_state = true; break; }
-    }
-
-    // Also check converted pub_pos for finiteness/extreme z
-    if (!finite3(pub_pos) || std::abs(pub_pos.z()) > ABS_MAX_PUBPOS_Z) {
-      abnormal_raw_state = true;
-    }
-
-    if (abnormal_raw_state) {
-      RCLCPP_ERROR(this->get_logger(),
-        "publishState: ABNORMAL raw state.pos or pub_pos detected -> using fallback. "
-        "raw state.pos=[%.12g, %.12g, %.12g] converted pub_pos=[%.12g, %.12g, %.12g]",
-        state.pos[0], state.pos[1], state.pos[2],
-        pub_pos.x(), pub_pos.y(), pub_pos.z()
-      );
-
-      // fallback to last valid ENU if available, otherwise a stable safe fallback:
-      if (have_last_valid_) {
-        pub_pos = last_valid_enu_;
-      } else {
-        // keep XY at zero, Z at initial altitude (init_blh_rad_.z() stores init height in meters)
-        pub_pos = Eigen::Vector3d(0.0, 0.0, init_blh_rad_.z());
-      }
-      used_fallback = true;
-      suppress_tf_and_path = true; // 在异常场景阻止 TF & Path 发布，避免破坏 RViz
-    } else {
-      // Additional guards on converted values (still keep previous clamping semantics)
-      if (!finite3(pub_pos) ||
-          std::abs(pub_pos.x()) > MAX_ACCEPT || std::abs(pub_pos.y()) > MAX_ACCEPT) {
-        RCLCPP_WARN(this->get_logger(),
-          "publishState: converted pub_pos out-of-bounds (%.3f, %.3f) -> fallback.",
-          pub_pos.x(), pub_pos.y());
-        if (have_last_valid_) pub_pos = last_valid_enu_;
-        else pub_pos = Eigen::Vector3d(0.0, 0.0, init_blh_rad_.z());
-        used_fallback = true;
-        suppress_tf_and_path = true;
-      } else {
-        // if we had a last valid and big z jump then smooth (existing logic)
-        if (have_last_valid_) {
-          double last_z = last_valid_enu_.z();
-          double dz = pub_pos.z() - last_z;
-          const double SMOOTH_Z_DELTA = 50.0; // 保持和上层一致
-          if (std::abs(dz) > SMOOTH_Z_DELTA) {
-            double sign = (dz > 0.0) ? 1.0 : -1.0;
-            double newz = last_z + sign * SMOOTH_Z_DELTA;
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-              "Smoothing large z jump: last_z=%.3f new_pub_z(from %.3f->%.3f) applied step=%.3f",
-              last_z, pub_pos.z(), newz, SMOOTH_Z_DELTA);
-            pub_pos.z() = newz;
-          }
-        }
-        // enforce path z consistency (if a path exists)
-        double reference_z = init_blh_rad_.z();
-        if (!path_msg_.poses.empty()) reference_z = path_msg_.poses.back().pose.position.z;
-        const double MAX_MATCH_Z_DIFF = 100.0;
-        double dzp = pub_pos.z() - reference_z;
-        if (!path_msg_.poses.empty() && std::abs(dzp) > MAX_MATCH_Z_DIFF) {
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Enforcing path-based z clamp: pub_z=%.3f path_z=%.3f diff=%.3f -> setting pub_z to path_z",
-            pub_pos.z(), reference_z, dzp);
-          pub_pos.z() = reference_z;
-        }
-        // clamp absolute extreme z to safe band around init_alt just in case
-        const double MAX_ALT_DELTA = 2000.0;
-        if (std::abs(pub_pos.z() - init_blh_rad_.z()) > MAX_ALT_DELTA) {
-          double clamped = init_blh_rad_.z() + std::copysign(MAX_ALT_DELTA, pub_pos.z() - init_blh_rad_.z());
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Clamping pub_pos.z from %.3f to safe band %.3f (init_alt=%.3f)", pub_pos.z(), clamped, init_blh_rad_.z());
-          pub_pos.z() = clamped;
-        }
-        // accept as last valid
-        last_valid_enu_ = pub_pos;
-        have_last_valid_ = true;
-      }
-    }
-
-    // Compose odometry (always publish odom so some info remains available)
+    // Compose and publish odometry
     nav_msgs::msg::Odometry odom;
     odom.header.stamp.sec = sec;
     odom.header.stamp.nanosec = nanosec;
@@ -664,95 +549,144 @@ private:
     odom.pose.pose.position.y = pub_pos.y();
     odom.pose.pose.position.z = pub_pos.z();
 
-    odom.pose.pose.orientation.x = q.x();
-    odom.pose.pose.orientation.y = q.y();
-    odom.pose.pose.orientation.z = q.z();
-    odom.pose.pose.orientation.w = q.w();
-    odom.child_frame_id = "base_link";
+    // --- Robust euler -> quaternion conversion & smoothing ---
+    Eigen::AngleAxisd rx(state.euler(0), Eigen::Vector3d::UnitX());
+    Eigen::AngleAxisd ry(state.euler(1), Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd rz(state.euler(2), Eigen::Vector3d::UnitZ());
 
-    if (odom_pub_) {
-      odom_pub_->publish(odom);
+    // Two candidate conventions
+    Eigen::Quaterniond q_z_y_x = rz * ry * rx; // original (Z * Y * X)
+    Eigen::Quaterniond q_x_y_z = rx * ry * rz; // alternate (X * Y * Z)
+
+    if (q_z_y_x.norm() > 0.0) q_z_y_x.normalize(); else q_z_y_x = Eigen::Quaterniond::Identity();
+    if (q_x_y_z.norm() > 0.0) q_x_y_z.normalize(); else q_x_y_z = Eigen::Quaterniond::Identity();
+
+    // choose candidate closest to previous published quaternion (handles sign ambiguity by abs(dot))
+    Eigen::Quaterniond q_pick = q_z_y_x;
+    if (have_prev_q_) {
+      double dot_z = std::abs(q_z_y_x.dot(prev_q_));
+      double dot_x = std::abs(q_x_y_z.dot(prev_q_));
+      q_pick = (dot_z >= dot_x) ? q_z_y_x : q_x_y_z;
+    } else {
+      q_pick = q_z_y_x;
     }
 
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "Published odom pos=%.3f %.3f %.3f quat=%.6f %.6f %.6f %.6f (converted=%d fallback=%d suppress_tf_path=%d)",
-      pub_pos.x(), pub_pos.y(), pub_pos.z(), q.x(), q.y(), q.z(), q.w(), (abnormal_raw_state?0:1), used_fallback?1:0, suppress_tf_and_path?1:0);
+    // clamp / smooth large single-step rotations using slerp
+    const double MAX_ANGLE_DEG = 45.0;
+    const double MAX_ANGLE_RAD = MAX_ANGLE_DEG * M_PI / 180.0;
+    if (have_prev_q_) {
+      double raw_dot = prev_q_.dot(q_pick);
+      // handle potential numeric overshoot
+      double cosang = std::min(1.0, std::max(-1.0, raw_dot));
+      double ang = 2.0 * acos(std::abs(cosang)); // geodesic angle (use abs to handle +/- quaternion sign)
+      if (ang > MAX_ANGLE_RAD) {
+        // slerp a fraction towards new orientation to avoid immediate flips in RViz
+        double alpha = 0.15; // smoothing factor (tunable)
+        Eigen::Quaterniond q_slerp = prev_q_.slerp(alpha, q_pick);
+        if (q_slerp.norm() > 0.0) q_slerp.normalize();
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Large quat jump detected (%.1f deg). Slerping alpha=%.2f", ang*180.0/M_PI, alpha);
+        q_pick = q_slerp;
+      }
+    }
 
-    // Publish TF only if not suppressed
-    if (!suppress_tf_and_path && tf_broadcaster_) {
+    // final safety normalize
+    if (q_pick.norm() <= 0.0) q_pick = Eigen::Quaterniond::Identity();
+    else q_pick.normalize();
+
+    // store prev quaternion for next frame
+    prev_q_ = q_pick;
+    have_prev_q_ = true;
+
+    // write orientation to odom
+    odom.pose.pose.orientation.x = q_pick.x();
+    odom.pose.pose.orientation.y = q_pick.y();
+    odom.pose.pose.orientation.z = q_pick.z();
+    odom.pose.pose.orientation.w = q_pick.w();
+    odom.child_frame_id = "base_link";
+
+    odom_pub_->publish(odom);
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "Published odom pos=%.3f %.3f %.3f quat=%.6f %.6f %.6f %.6f (detected=%s converted=%d fallback=%d ref_z=%.3f)",
+      pub_pos.x(), pub_pos.y(), pub_pos.z(), q_pick.x(), q_pick.y(), q_pick.z(), q_pick.w(), detected.c_str(), converted?1:0, used_fallback?1:0, reference_z);
+
+    // publish TF (same pub_pos + q_pick)
+    if (tf_broadcaster_) {
       geometry_msgs::msg::TransformStamped t;
       t.header.stamp.sec = sec; t.header.stamp.nanosec = nanosec;
       t.header.frame_id = "map"; t.child_frame_id = "base_link";
       t.transform.translation.x = pub_pos.x();
       t.transform.translation.y = pub_pos.y();
       t.transform.translation.z = pub_pos.z();
-      t.transform.rotation.x = q.x();
-      t.transform.rotation.y = q.y();
-      t.transform.rotation.z = q.z();
-      t.transform.rotation.w = q.w();
+      t.transform.rotation.x = q_pick.x();
+      t.transform.rotation.y = q_pick.y();
+      t.transform.rotation.z = q_pick.z();
+      t.transform.rotation.w = q_pick.w();
       tf_broadcaster_->sendTransform(t);
-    } else if (suppress_tf_and_path) {
-      RCLCPP_DEBUG(this->get_logger(), "TF suppressed for abnormal state to avoid RViz corruption.");
     }
 
-    // Path handling: only append safe points (原来的过滤逻辑，条件更严格：不能是 fallback，且不被抑制)
-    if (path_pub_ && !used_fallback && !suppress_tf_and_path) {
-      geometry_msgs::msg::PoseStamped ps;
-      ps.header.frame_id = "map";
-      ps.header.stamp.sec = sec; ps.header.stamp.nanosec = nanosec;
-      ps.pose = odom.pose.pose;
+    // Path handling (append only when not fallback and position plausible)
+    if (path_pub_) {
+      if (!used_fallback && publish_raw) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header.frame_id = "map";
+        ps.header.stamp.sec = sec; ps.header.stamp.nanosec = nanosec;
+        ps.pose = odom.pose.pose;
 
-      const double min_dist_xy = 0.02; // meters (XY-only)
-      const double min_dt   = 0.02; // seconds
-      bool push = false;
-      if (path_msg_.poses.empty()) push = true;
-      else {
-        auto &last = path_msg_.poses.back();
-        double dx = ps.pose.position.x - last.pose.position.x;
-        double dy = ps.pose.position.y - last.pose.position.y;
-        double dist_xy = std::sqrt(dx*dx + dy*dy);
-        uint64_t prev_ns = uint64_t(last.header.stamp.sec) * 1000000000ULL + uint64_t(last.header.stamp.nanosec);
-        uint64_t cur_ns  = uint64_t(ps.header.stamp.sec) * 1000000000ULL + uint64_t(ps.header.stamp.nanosec);
-        double dt = (cur_ns > prev_ns) ? double(cur_ns - prev_ns) * 1e-9 : 0.0;
-        if (dist_xy >= min_dist_xy || dt >= min_dt) push = true;
-      }
-      if (push) {
-        // clamp huge z jumps for path continuity
+        // If path exists we ensure path's z stays consistent with reference_z (keeps path internal z stable)
         if (!path_msg_.poses.empty()) {
-          double last_z = path_msg_.poses.back().pose.position.z;
-          const double MAX_PATH_Z_JUMP = 100.0;
-          double dz = ps.pose.position.z - last_z;
-          if (std::abs(dz) > MAX_PATH_Z_JUMP) {
-            double sign = (dz > 0.0) ? 1.0 : -1.0;
-            double clamped_z = last_z + sign * MAX_PATH_Z_JUMP;
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-              "Clamping path point z from %.3f to %.3f (dz=%.3f > %g)", ps.pose.position.z, clamped_z, dz, MAX_PATH_Z_JUMP);
-            ps.pose.position.z = clamped_z;
+          ps.pose.position.z = path_msg_.poses.back().pose.position.z;
+        }
+
+        const double min_dist_xy = 0.02; // meters (XY-only)
+        const double min_dt   = 0.02; // seconds
+        bool push = false;
+        if (path_msg_.poses.empty()) push = true;
+        else {
+          auto &last = path_msg_.poses.back();
+          double dx = ps.pose.position.x - last.pose.position.x;
+          double dy = ps.pose.position.y - last.pose.position.y;
+          double dist_xy = std::sqrt(dx*dx + dy*dy);
+          uint64_t prev_ns = uint64_t(last.header.stamp.sec) * 1000000000ULL + uint64_t(last.header.stamp.nanosec);
+          uint64_t cur_ns  = uint64_t(ps.header.stamp.sec) * 1000000000ULL + uint64_t(ps.header.stamp.nanosec);
+          double dt = (cur_ns > prev_ns) ? double(cur_ns - prev_ns) * 1e-9 : 0.0;
+          if (dist_xy >= min_dist_xy || dt >= min_dt) push = true;
+        }
+        if (push) {
+          // If new point z differs hugely from last path z, clamp it instead of skipping to keep continuity
+          if (!path_msg_.poses.empty()) {
+            double last_z = path_msg_.poses.back().pose.position.z;
+            const double MAX_PATH_Z_JUMP = 100.0; // clamp jump (m)
+            double dz = ps.pose.position.z - last_z;
+            if (std::abs(dz) > MAX_PATH_Z_JUMP) {
+              double sign = (dz > 0.0) ? 1.0 : -1.0;
+              double clamped_z = last_z + sign * MAX_PATH_Z_JUMP;
+              RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Clamping path point z from %.3f to %.3f (dz=%.3f > %g)", ps.pose.position.z, clamped_z, dz, MAX_PATH_Z_JUMP);
+              ps.pose.position.z = clamped_z;
+            }
           }
+          path_msg_.poses.push_back(ps);
+          const size_t maxlen = 50000;
+          if (path_msg_.poses.size() > maxlen) {
+            path_msg_.poses.erase(path_msg_.poses.begin(), path_msg_.poses.begin() + (path_msg_.poses.size() - maxlen));
+          }
+          path_msg_.header.stamp.sec = sec; path_msg_.header.stamp.nanosec = nanosec;
+          path_pub_->publish(path_msg_);
+          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "Published path size=%zu last=(%.3f,%.3f,%.3f)",
+            path_msg_.poses.size(),
+            path_msg_.poses.back().pose.position.x,
+            path_msg_.poses.back().pose.position.y,
+            path_msg_.poses.back().pose.position.z);
         }
-        path_msg_.poses.push_back(ps);
-        const size_t maxlen = 50000;
-        if (path_msg_.poses.size() > maxlen) {
-          path_msg_.poses.erase(path_msg_.poses.begin(), path_msg_.poses.begin() + (path_msg_.poses.size() - maxlen));
-        }
-        path_msg_.header.stamp.sec = sec; path_msg_.header.stamp.nanosec = nanosec;
-        path_pub_->publish(path_msg_);
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-          "Published path size=%zu last=(%.3f,%.3f,%.3f)",
-          path_msg_.poses.size(),
-          path_msg_.poses.back().pose.position.x,
-          path_msg_.poses.back().pose.position.y,
-          path_msg_.poses.back().pose.position.z);
-      }
-    } else {
-      if (suppress_tf_and_path) {
-        RCLCPP_DEBUG(this->get_logger(), "Skipping path append due to suppressed publishing (abnormal state).");
-      } else if (used_fallback) {
-        RCLCPP_DEBUG(this->get_logger(), "Skipping path append because fallback was used.");
+      } else {
+        RCLCPP_DEBUG(this->get_logger(), "Skipping path append due to fallback or unsafe pub_pos");
       }
     }
 
-    if (used_fallback && !suppress_tf_and_path) {
+    if (used_fallback) {
       RCLCPP_DEBUG(this->get_logger(), "publishState used fallback ENU (%g,%g,%g)", pub_pos.x(), pub_pos.y(), pub_pos.z());
     }
   }
@@ -778,10 +712,9 @@ private:
   Eigen::Vector3d last_valid_enu_{0,0,0};
   bool have_last_valid_{false};
 
-  // orientation smoothing / sign alignment
-  Eigen::Quaterniond last_published_quat_;
-  bool have_last_quat_;
-  double orientation_slerp_alpha_{0.2};
+  // previous quaternion for smoothing / convention selection
+  Eigen::Quaterniond prev_q_ = Eigen::Quaterniond::Identity();
+  bool have_prev_q_{false};
 };
 
 int main(int argc, char **argv) {

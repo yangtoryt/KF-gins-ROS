@@ -13,7 +13,7 @@ endif()
 # 查找 Eigen3（必须在 include_directories 前执行）
 find_package(Eigen3 REQUIRED)
 # 打印 Eigen3 路径（调试用，确认是否找到）
-message("Eigen3 include directory: ${EIGEN3_INCLUDE_DIRS}")
+message(STATUS "Eigen3 include directory: ${EIGEN3_INCLUDE_DIRS}")
 
 # 统一设置包含目录（合并重复的 include_directories，确保 Eigen 路径生效）
 include_directories(
@@ -22,13 +22,17 @@ include_directories(
   ${KF_GINS_ROOT}/include  # KF-GINS 核心库头文件路径
 )
 
-# 其他配置保持不变...
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(ament_index_cpp REQUIRED)  # 新增：查找 ament_index_cpp 包
+find_package(ament_index_cpp REQUIRED)
+
+# 新增：tf2 / tf2_ros / tf2_msgs（用于 TF 广播/消息）
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_msgs REQUIRED)
 
 # 查找 kf_gins 核心库
 find_library(KF_GINS_CORE 
@@ -39,12 +43,14 @@ if(NOT KF_GINS_CORE)
   message(FATAL_ERROR "libkf_gins_core not found. Set KF_GINS_ROOT or install to system path.")
 endif()
 
-# 默认 C++14
+# 使用 C++17（std::clamp 等）
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
 endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 生成可执行文件
+# 生成可执行文件（将 gi_engine/insmech 源也编译进来）
 add_executable(kf_gins_ros2_node
   src/kf_gins_node.cpp
   kf-gins/gi_engine.cpp
@@ -56,6 +62,9 @@ ament_target_dependencies(kf_gins_ros2_node
   sensor_msgs
   geometry_msgs
   nav_msgs
+  tf2
+  tf2_ros
+  tf2_msgs
   ament_index_cpp
 )
 

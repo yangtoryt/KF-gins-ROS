@@ -1,6 +1,9 @@
-// src/kf_gins_node.cpp (robust version with additional safety logging and stronger Z clamp)
-// Prioritize path z and clamp odom/tf z to avoid huge vertical teleports that ruin RViz view.
-// Added: more verbose debug prints and a final hard-clamp on z to avoid publishing absurd heights.
+// src/kf_gins_node.cpp (robust version + microdeg/1e7-deg detection + TF switch)
+//
+// 关键改动：
+// 1) 判别 state.pos 时新增 llh_microdeg(度×1e6) & llh_deg1e7(度×1e7) → 统一转 ENU(m)
+// 2) 增加 publish_tf 参数（默认 true），方便调试时关闭 TF
+// 3) 更清晰的日志：detected=llh_microdeg/llh_deg1e7 等
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -32,21 +35,23 @@ static inline bool finite3(const Eigen::Vector3d &v) {
   return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
 }
 
+// BLH(rad) -> ECEF(m)
 static void blhToEcef(double lat, double lon, double h, Eigen::Vector3d &ecef) {
   const double a = 6378137.0;
   const double f = 1.0 / 298.257223563;
   const double e2 = f * (2.0 - f);
-  double sLat = sin(lat), cLat = cos(lat);
-  double sLon = sin(lon), cLon = cos(lon);
-  double N = a / sqrt(1.0 - e2 * sLat * sLat);
+  const double sLat = std::sin(lat), cLat = std::cos(lat);
+  const double sLon = std::sin(lon), cLon = std::cos(lon);
+  const double N = a / std::sqrt(1.0 - e2 * sLat * sLat);
   ecef.x() = (N + h) * cLat * cLon;
   ecef.y() = (N + h) * cLat * sLon;
   ecef.z() = (N * (1.0 - e2) + h) * sLat;
 }
 
+// ECEF->ENU 的旋转（rad 入）
 static Eigen::Matrix3d ecefToEnuRot(double lat0, double lon0) {
-  double sLat = sin(lat0), cLat = cos(lat0);
-  double sLon = sin(lon0), cLon = cos(lon0);
+  const double sLat = std::sin(lat0), cLat = std::cos(lat0);
+  const double sLon = std::sin(lon0), cLon = std::cos(lon0);
   Eigen::Matrix3d R;
   R << -sLon,         cLon,         0,
        -cLon*sLat, -sLon*sLat,  cLat,
@@ -97,8 +102,11 @@ public:
     this->declare_parameter<bool>("imu_is_increment", true); // 默认按 ROS 标准：速率/加速度
     this->declare_parameter<std::string>("imu_units", "si");  // "si" 或 "deg_g"
 
-    // 可调：四元数平滑强度（new_weight，0..1, 0: 全部用旧，1: 全部用新）
+    // 可调：四元数平滑强度
     this->declare_parameter<double>("orientation_slerp_alpha", 0.2);
+
+    // 新增：是否发布 TF（调试时可关）
+    this->declare_parameter<bool>("publish_tf", true);
 
     std::string pkg_path = ament_index_cpp::get_package_share_directory("kf_gins_node");
     std::string imu_path, gps_path;
@@ -163,14 +171,14 @@ public:
     if (this->get_parameter("antlever", v) && v.size() >= 3) {
       options.antlever = Eigen::Vector3d(v[0], v[1], v[2]);
     }
-    const double DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC = M_PI / 180.0 / sqrt(3600.0);
+    const double DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC = M_PI / 180.0 / std::sqrt(3600.0);
     if (this->get_parameter("imunoise.arw", v) && v.size() >= 3)
       options.imunoise.gyr_arw = Eigen::Vector3d(
         v[0] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC,
         v[1] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC,
         v[2] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC
       );
-    const double MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC = 1.0 / sqrt(3600.0);
+    const double MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC = 1.0 / std::sqrt(3600.0);
     if (this->get_parameter("imunoise.vrw", v) && v.size() >= 3)
       options.imunoise.acc_vrw = Eigen::Vector3d(
         v[0] * MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC,
@@ -226,11 +234,13 @@ public:
     this->get_parameter("imu_is_increment", imu_is_increment_);
     this->get_parameter("imu_units", imu_units_);
     this->get_parameter("orientation_slerp_alpha", orientation_slerp_alpha_);
+    this->get_parameter("publish_tf", publish_tf_);
 
     RCLCPP_INFO(this->get_logger(), "Loaded imu_is_increment from config: %s",
                 imu_is_increment_ ? "true" : "false");
     RCLCPP_INFO(this->get_logger(), "Final imu_is_increment = %s, imu_units = %s, slerp_alpha=%.3f",
                 imu_is_increment_ ? "true" : "false", imu_units_.c_str(), orientation_slerp_alpha_);
+    RCLCPP_INFO(this->get_logger(), "publish_tf = %s", publish_tf_ ? "true" : "false");
 
     auto sanitize_vec3 = [](Eigen::Vector3d &v, const Eigen::Vector3d &fallback){
         for (int i=0;i<3;++i) if (!std::isfinite(v[i])) v[i] = fallback[i];
@@ -249,7 +259,7 @@ public:
     RCLCPP_INFO(this->get_logger(), "Sanitized initstate euler=%g %g %g (rad)", options.initstate.euler[0], options.initstate.euler[1], options.initstate.euler[2]);
     RCLCPP_INFO(this->get_logger(), "Sanitized imuerror gyrbias=%g %g %g", options.initstate.imuerror.gyrbias[0], options.initstate.imuerror.gyrbias[1], options.initstate.imuerror.gyrbias[2]);
 
-    // Print options if available
+    // Print options
     options.print_options();
 
     // ------------ 创建引擎 ------------
@@ -391,11 +401,8 @@ private:
     NavState state = engine_->getNavState();
 
     if (navstateHasInvalid(state)) {
-      RCLCPP_ERROR(this->get_logger(), "NavState contains NaN/Inf! Skipping publish and dumping debug info.");
+      RCLCPP_ERROR(this->get_logger(), "NavState contains NaN/Inf! Skipping publish.");
       RCLCPP_ERROR(this->get_logger(), "last_imu_time=%.6f", last_imu_time_);
-      if (engine_) {
-        RCLCPP_WARN(this->get_logger(), "GIEngine::debugDump() not invoked (may not be available in this build).");
-      }
       return;
     }
 
@@ -405,97 +412,116 @@ private:
     int32_t sec = static_cast<int32_t>(now_ns / 1000000000ULL);
     uint32_t nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
 
-    // Determine what state.pos represents and convert to local ENU meters (pub_pos)
-    Eigen::Vector3d pub_pos = state.pos; // default assume ENU
+    // === 统一把 state.pos 转 ENU(m) ===
+    Eigen::Vector3d pub_pos = state.pos; // default assume ENU(m)
     bool converted = false;
     std::string detected = "unknown";
 
-    // Print raw state.pos for diagnostics
     RCLCPP_DEBUG(this->get_logger(), "Raw state.pos = [%.12g, %.12g, %.12g]", state.pos[0], state.pos[1], state.pos[2]);
 
     if (std::isfinite(state.pos[0]) && std::isfinite(state.pos[1]) && std::isfinite(state.pos[2])) {
-      double ax = std::abs(state.pos[0]), ay = std::abs(state.pos[1]), az = std::abs(state.pos[2]);
+      const double ax = std::abs(state.pos[0]);
+      const double ay = std::abs(state.pos[1]);
+      const double az = std::abs(state.pos[2]);
+
+      // 1) ENU(m) 范围
       if (ax < 1e5 && ay < 1e5 && az < 2e4) {
-        // likely ENU (meters)
-        converted = true;
-        detected = "enu";
-        pub_pos = state.pos;
+        converted = true; detected = "enu"; pub_pos = state.pos;
       } else {
-        // BLH in radians?
-        if (std::abs(state.pos[0]) <= 1.2 && std::abs(state.pos[1]) <= 1.2 && std::abs(state.pos[2]) < 1e5) {
+        // 2) BLH(rad)
+        if (ax <= 1.2 && ay <= 1.2 && az < 1e5) {
           Eigen::Vector3d ecef, ecef_ref;
           blhToEcef(state.pos[0], state.pos[1], state.pos[2], ecef);
           blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
           Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
           pub_pos = R * (ecef - ecef_ref);
-          converted = true;
-          detected = "blh_rad";
-          RCLCPP_DEBUG(this->get_logger(), "publishState: treated state.pos as BLH (rad).");
+          converted = true; detected = "blh_rad";
         }
-        // BLH in degrees?
-        else if (std::abs(state.pos[0]) <= 180.0 && std::abs(state.pos[1]) <= 180.0 && std::abs(state.pos[2]) < 1e5) {
-          double lat_rad = state.pos[0] * M_PI / 180.0;
-          double lon_rad = state.pos[1] * M_PI / 180.0;
+        // 3) BLH(deg)
+        else if (ax <= 180.0 && ay <= 180.0 && az < 1e5) {
+          const double lat_rad = state.pos[0] * M_PI / 180.0;
+          const double lon_rad = state.pos[1] * M_PI / 180.0;
           Eigen::Vector3d ecef, ecef_ref;
           blhToEcef(lat_rad, lon_rad, state.pos[2], ecef);
           blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
           Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
           pub_pos = R * (ecef - ecef_ref);
-          converted = true;
-          detected = "blh_deg";
-          RCLCPP_DEBUG(this->get_logger(), "publishState: treated state.pos as BLH (deg).");
+          converted = true; detected = "blh_deg";
         }
-        // ECEF?
+        // 4) BLH(度×1e6) micro-deg
+        else if (ax <= 90.0e6 && ay <= 180.0e6 && az < 1e8) {
+          const double lat_deg = state.pos[0] / 1e6;
+          const double lon_deg = state.pos[1] / 1e6;
+          const double h_m     = state.pos[2]; // 高度通常已是米；若是毫米/厘米可按需再加判断
+          const double lat_rad = lat_deg * M_PI / 180.0;
+          const double lon_rad = lon_deg * M_PI / 180.0;
+          Eigen::Vector3d ecef, ecef_ref;
+          blhToEcef(lat_rad, lon_rad, h_m, ecef);
+          blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
+          Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
+          pub_pos = R * (ecef - ecef_ref);
+          converted = true; detected = "blh_microdeg(1e6)";
+        }
+        // 5) BLH(度×1e7)
+        else if (ax <= 90.0e7 && ay <= 180.0e7 && az < 1e9) {
+          const double lat_deg = state.pos[0] / 1e7;
+          const double lon_deg = state.pos[1] / 1e7;
+          const double h_m     = state.pos[2];
+          const double lat_rad = lat_deg * M_PI / 180.0;
+          const double lon_rad = lon_deg * M_PI / 180.0;
+          Eigen::Vector3d ecef, ecef_ref;
+          blhToEcef(lat_rad, lon_rad, h_m, ecef);
+          blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
+          Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
+          pub_pos = R * (ecef - ecef_ref);
+          converted = true; detected = "blh_deg1e7";
+        }
+        // 6) ECEF(m)
         else {
-          double norm = state.pos.norm();
+          const double norm = state.pos.norm();
           if ((norm > 3.0e6 && norm < 1.2e7) ||
-              std::abs(state.pos[0]) > 1e6 || std::abs(state.pos[1]) > 1e6 || std::abs(state.pos[2]) > 1e6) {
+              ax > 1e6 || ay > 1e6 || az > 1e6) {
             Eigen::Vector3d ecef_ref;
             blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
             Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
             pub_pos = R * (state.pos - ecef_ref);
-            converted = true;
-            detected = "ecef";
-            RCLCPP_DEBUG(this->get_logger(), "publishState: treated state.pos as ECEF (norm=%g).", norm);
+            converted = true; detected = "ecef";
           } else {
             detected = "unrecognized";
-            RCLCPP_DEBUG(this->get_logger(), "publishState: state.pos not recognized (abs=%g,%g,%g norm=%g).", ax, ay, az, norm);
           }
         }
       }
     }
 
-    // SAFETY/GATING: do not accept absurdly large ENU numbers to publish.
+    // SAFETY/GATING：限制异常 ENU 值
     bool used_fallback = false;
     const double MAX_ACCEPT = 5e5; // 500 km guard
-    const double MAX_ALT_DELTA = 2000.0; // +/- 2000 m allowed relative to init altitude
-    const double SMOOTH_Z_DELTA = 50.0; // smoothing step if needed
-    const double MAX_MATCH_Z_DIFF = 100.0; // if pub_pos.z differs from path_z by > this, clamp to path_z
+    const double MAX_ALT_DELTA = 2000.0; // +/- 2000 m
+    const double SMOOTH_Z_DELTA = 50.0;
+    const double MAX_MATCH_Z_DIFF = 100.0;
 
-    double init_alt = init_blh_rad_.z(); // initial altitude (meters)
+    const double init_alt = init_blh_rad_.z();
     bool publish_raw = true;
 
-    // Log detection result
     RCLCPP_DEBUG(this->get_logger(), "Detected pos format=%s converted=%d pub_pos(before clamp)=[%.6f, %.6f, %.6f] init_alt=%.3f",
                  detected.c_str(), converted?1:0, pub_pos.x(), pub_pos.y(), pub_pos.z(), init_alt);
 
     if (!converted) {
       publish_raw = false;
-      RCLCPP_DEBUG(this->get_logger(), "publishState: not converted (detected=%s) -> will fallback.", detected.c_str());
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "publishState: not converted (detected=%s) -> fallback.", detected.c_str());
     } else {
       if (!finite3(pub_pos) ||
           std::abs(pub_pos.x()) > MAX_ACCEPT || std::abs(pub_pos.y()) > MAX_ACCEPT ||
           std::abs(pub_pos.z() - init_alt) > MAX_ALT_DELTA) {
-        // If pub_pos is out of acceptable bounds, try alternate detection: maybe the z is actually altitude offset vs init?
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "publishState: converted pub_pos out of bounds (detected=%s) -> pub_pos=(%.6f,%.6f,%.6f) init_alt=%.3f",
-          detected.c_str(), pub_pos.x(), pub_pos.y(), pub_pos.z(), init_alt);
-        publish_raw = true; // still publish but force strong z clamp below (to avoid whole fallback)
-        // we don't immediately set used_fallback true — we try to salvage XY and clamp Z
+          "publishState: converted pub_pos out of bounds: [%.3f,%.3f,%.3f], init_alt=%.3f (detected=%s)",
+          pub_pos.x(), pub_pos.y(), pub_pos.z(), init_alt, detected.c_str());
+        publish_raw = true; // 仍然发布，但 z 会被强力钳制
       }
     }
 
-    // Determine reference_z: prefer latest path point if available, otherwise last_valid or init_alt
+    // 选参考 z
     double reference_z = init_alt;
     if (!path_msg_.poses.empty()) {
       reference_z = path_msg_.poses.back().pose.position.z;
@@ -504,63 +530,39 @@ private:
     }
 
     if (!publish_raw) {
-      // fallback to last valid or zero
       if (have_last_valid_) {
         pub_pos = last_valid_enu_;
         used_fallback = true;
-        RCLCPP_DEBUG(this->get_logger(), "publishState: using last_valid_enu as fallback [%g,%g,%g]", pub_pos.x(), pub_pos.y(), pub_pos.z());
       } else {
-        pub_pos = Eigen::Vector3d::Zero();
+        pub_pos = Eigen::Vector3d(0.0, 0.0, init_alt);
         used_fallback = true;
-        RCLCPP_DEBUG(this->get_logger(), "publishState: no last valid -> publishing Zero fallback");
       }
     } else {
-      // If we have last valid and z jump is big, do smoothing step to avoid teleport
       if (have_last_valid_) {
-        double last_z = last_valid_enu_.z();
-        double dz = pub_pos.z() - last_z;
+        const double last_z = last_valid_enu_.z();
+        const double dz = pub_pos.z() - last_z;
         if (std::abs(dz) > SMOOTH_Z_DELTA) {
-          double sign = (dz > 0.0) ? 1.0 : -1.0;
-          double newz = last_z + sign * SMOOTH_Z_DELTA;
+          pub_pos.z() = last_z + (dz > 0.0 ? SMOOTH_Z_DELTA : -SMOOTH_Z_DELTA);
           RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Smoothing large z jump: last_z=%.3f new_pub_z(from %.3f->%.3f) applied step=%.3f",
-            last_z, pub_pos.z(), newz, SMOOTH_Z_DELTA);
-          pub_pos.z() = newz;
+            "Smoothing large z jump.");
         }
       }
-      // enforce path z if path exists
       if (!path_msg_.poses.empty()) {
-        double dzp = pub_pos.z() - reference_z;
+        const double dzp = pub_pos.z() - reference_z;
         if (std::abs(dzp) > MAX_MATCH_Z_DIFF) {
           RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Enforcing path-based z clamp: pub_z=%.3f path_z=%.3f diff=%.3f -> setting pub_z to path_z",
-            pub_pos.z(), reference_z, dzp);
+            "Enforcing path-based z clamp.");
           pub_pos.z() = reference_z;
         }
       }
-
-      // *** FINAL HARD SANITY: 如果高度仍然异常（绝对值超大或离 init_alt 过远），强制设置为 reference_z 或 init_alt ***
       if (!std::isfinite(pub_pos.z()) || std::abs(pub_pos.z()) > 1e4 || std::abs(pub_pos.z() - init_alt) > MAX_ALT_DELTA) {
-        double final_z = init_alt;
-        if (!path_msg_.poses.empty()) final_z = reference_z;
-        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "Final safety clamp: pub_pos.z=%g out-of-bounds -> forcing pub_pos.z=%g (init_alt=%g ref_z=%g)",
-          pub_pos.z(), final_z, init_alt, reference_z);
-        pub_pos.z() = final_z;
+        pub_pos.z() = reference_z; // 优先跟随 path，否则 init_alt
       }
-
-      // accept as "last valid"
       last_valid_enu_ = pub_pos;
       have_last_valid_ = true;
     }
 
-    // Log final publish position
-    RCLCPP_DEBUG(this->get_logger(), "Final pub_pos = [%.6f, %.6f, %.6f] (used_fallback=%d)", pub_pos.x(), pub_pos.y(), pub_pos.z(), used_fallback?1:0);
-
-        // ==========================
-    // Compose + safety-guarded publish (Replace original odom/tf/path block)
-    // ==========================
-    // euler -> quaternion
+    // ============ 姿态 ============
     Eigen::AngleAxisd rx(state.euler(0), Eigen::Vector3d::UnitX());
     Eigen::AngleAxisd ry(state.euler(1), Eigen::Vector3d::UnitY());
     Eigen::AngleAxisd rz(state.euler(2), Eigen::Vector3d::UnitZ());
@@ -568,97 +570,23 @@ private:
     if (q.norm() <= 0.0) q = Eigen::Quaterniond::Identity();
     else q.normalize();
 
-    // Strong protection thresholds (可按需调节)
-    const double ABS_MAX_COMPONENT = 1.0e7;   // 若 state.pos 任一分量超此值，认为异常
-    const double ABS_MAX_PUBPOS_Z   = 1.0e5;  // 若转换后 pub_pos.z 超此值，认为异常（100 km）
-    const double MAX_ACCEPT_XY = 5e5;         // 与之前逻辑一致的最大 XY 可接受值
+    // 额外异常检查
     bool suppress_tf_and_path = false;
-
-    // Extra checks on raw state.pos before trusting conversions
-    bool abnormal_raw_state = false;
-    for (int i=0;i<3;++i) {
-      if (!std::isfinite(state.pos[i])) { abnormal_raw_state = true; break; }
-      if (std::abs(state.pos[i]) > ABS_MAX_COMPONENT) { abnormal_raw_state = true; break; }
-    }
-
-    // Also check converted pub_pos for finiteness/extreme z
-    if (!finite3(pub_pos) || std::abs(pub_pos.z()) > ABS_MAX_PUBPOS_Z) {
-      abnormal_raw_state = true;
-    }
-
-    if (abnormal_raw_state) {
-      RCLCPP_ERROR(this->get_logger(),
-        "publishState: ABNORMAL raw state.pos or pub_pos detected -> using fallback. "
-        "raw state.pos=[%.12g, %.12g, %.12g] converted pub_pos=[%.12g, %.12g, %.12g]",
-        state.pos[0], state.pos[1], state.pos[2],
-        pub_pos.x(), pub_pos.y(), pub_pos.z()
-      );
-
-      // fallback to last valid ENU if available, otherwise a stable safe fallback:
-      if (have_last_valid_) {
-        pub_pos = last_valid_enu_;
-      } else {
-        // keep XY at zero, Z at initial altitude (init_blh_rad_.z() stores init height in meters)
-        pub_pos = Eigen::Vector3d(0.0, 0.0, init_blh_rad_.z());
-      }
+    if (!finite3(pub_pos) ||
+        std::abs(pub_pos.x()) > MAX_ACCEPT || std::abs(pub_pos.y()) > MAX_ACCEPT) {
+      if (have_last_valid_) pub_pos = last_valid_enu_;
+      else pub_pos = Eigen::Vector3d(0.0, 0.0, init_alt);
       used_fallback = true;
-      suppress_tf_and_path = true; // 在异常场景阻止 TF & Path 发布，避免破坏 RViz
-    } else {
-      // Additional guards on converted values (still keep previous clamping semantics)
-      if (!finite3(pub_pos) ||
-          std::abs(pub_pos.x()) > MAX_ACCEPT || std::abs(pub_pos.y()) > MAX_ACCEPT) {
-        RCLCPP_WARN(this->get_logger(),
-          "publishState: converted pub_pos out-of-bounds (%.3f, %.3f) -> fallback.",
-          pub_pos.x(), pub_pos.y());
-        if (have_last_valid_) pub_pos = last_valid_enu_;
-        else pub_pos = Eigen::Vector3d(0.0, 0.0, init_blh_rad_.z());
-        used_fallback = true;
-        suppress_tf_and_path = true;
-      } else {
-        // if we had a last valid and big z jump then smooth (existing logic)
-        if (have_last_valid_) {
-          double last_z = last_valid_enu_.z();
-          double dz = pub_pos.z() - last_z;
-          const double SMOOTH_Z_DELTA = 50.0; // 保持和上层一致
-          if (std::abs(dz) > SMOOTH_Z_DELTA) {
-            double sign = (dz > 0.0) ? 1.0 : -1.0;
-            double newz = last_z + sign * SMOOTH_Z_DELTA;
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-              "Smoothing large z jump: last_z=%.3f new_pub_z(from %.3f->%.3f) applied step=%.3f",
-              last_z, pub_pos.z(), newz, SMOOTH_Z_DELTA);
-            pub_pos.z() = newz;
-          }
-        }
-        // enforce path z consistency (if a path exists)
-        double reference_z = init_blh_rad_.z();
-        if (!path_msg_.poses.empty()) reference_z = path_msg_.poses.back().pose.position.z;
-        const double MAX_MATCH_Z_DIFF = 100.0;
-        double dzp = pub_pos.z() - reference_z;
-        if (!path_msg_.poses.empty() && std::abs(dzp) > MAX_MATCH_Z_DIFF) {
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Enforcing path-based z clamp: pub_z=%.3f path_z=%.3f diff=%.3f -> setting pub_z to path_z",
-            pub_pos.z(), reference_z, dzp);
-          pub_pos.z() = reference_z;
-        }
-        // clamp absolute extreme z to safe band around init_alt just in case
-        const double MAX_ALT_DELTA = 2000.0;
-        if (std::abs(pub_pos.z() - init_blh_rad_.z()) > MAX_ALT_DELTA) {
-          double clamped = init_blh_rad_.z() + std::copysign(MAX_ALT_DELTA, pub_pos.z() - init_blh_rad_.z());
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Clamping pub_pos.z from %.3f to safe band %.3f (init_alt=%.3f)", pub_pos.z(), clamped, init_blh_rad_.z());
-          pub_pos.z() = clamped;
-        }
-        // accept as last valid
-        last_valid_enu_ = pub_pos;
-        have_last_valid_ = true;
-      }
+      suppress_tf_and_path = true;
+      RCLCPP_ERROR(this->get_logger(), "publishState: ENU XY out-of-bounds, suppress TF/Path for this tick.");
     }
 
-    // Compose odometry (always publish odom so some info remains available)
+    // ============ 发布 Odom ============
     nav_msgs::msg::Odometry odom;
     odom.header.stamp.sec = sec;
     odom.header.stamp.nanosec = nanosec;
     odom.header.frame_id = "map";
+    odom.child_frame_id = "base_link";
 
     odom.pose.pose.position.x = pub_pos.x();
     odom.pose.pose.position.y = pub_pos.y();
@@ -668,18 +596,16 @@ private:
     odom.pose.pose.orientation.y = q.y();
     odom.pose.pose.orientation.z = q.z();
     odom.pose.pose.orientation.w = q.w();
-    odom.child_frame_id = "base_link";
 
-    if (odom_pub_) {
-      odom_pub_->publish(odom);
-    }
+    if (odom_pub_) odom_pub_->publish(odom);
 
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "Published odom pos=%.3f %.3f %.3f quat=%.6f %.6f %.6f %.6f (converted=%d fallback=%d suppress_tf_path=%d)",
-      pub_pos.x(), pub_pos.y(), pub_pos.z(), q.x(), q.y(), q.z(), q.w(), (abnormal_raw_state?0:1), used_fallback?1:0, suppress_tf_and_path?1:0);
+      "Published odom pos=%.3f %.3f %.3f quat=%.6f %.6f %.6f %.6f (detected=%s converted=%d fallback=%d suppress_tf_path=%d)",
+      pub_pos.x(), pub_pos.y(), pub_pos.z(), q.x(), q.y(), q.z(), q.w(),
+      detected.c_str(), converted?1:0, used_fallback?1:0, suppress_tf_and_path?1:0);
 
-    // Publish TF only if not suppressed
-    if (!suppress_tf_and_path && tf_broadcaster_) {
+    // ============ 发布 TF（可关闭） ============
+    if (publish_tf_ && !suppress_tf_and_path && tf_broadcaster_) {
       geometry_msgs::msg::TransformStamped t;
       t.header.stamp.sec = sec; t.header.stamp.nanosec = nanosec;
       t.header.frame_id = "map"; t.child_frame_id = "base_link";
@@ -691,43 +617,42 @@ private:
       t.transform.rotation.z = q.z();
       t.transform.rotation.w = q.w();
       tf_broadcaster_->sendTransform(t);
+    } else if (!publish_tf_) {
+      RCLCPP_DEBUG(this->get_logger(), "publish_tf=false, TF not sent.");
     } else if (suppress_tf_and_path) {
-      RCLCPP_DEBUG(this->get_logger(), "TF suppressed for abnormal state to avoid RViz corruption.");
+      RCLCPP_DEBUG(this->get_logger(), "TF suppressed for abnormal state.");
     }
 
-    // Path handling: only append safe points (原来的过滤逻辑，条件更严格：不能是 fallback，且不被抑制)
+    // ============ Path ============
     if (path_pub_ && !used_fallback && !suppress_tf_and_path) {
       geometry_msgs::msg::PoseStamped ps;
       ps.header.frame_id = "map";
       ps.header.stamp.sec = sec; ps.header.stamp.nanosec = nanosec;
       ps.pose = odom.pose.pose;
 
-      const double min_dist_xy = 0.02; // meters (XY-only)
+      const double min_dist_xy = 0.02; // meters
       const double min_dt   = 0.02; // seconds
       bool push = false;
       if (path_msg_.poses.empty()) push = true;
       else {
         auto &last = path_msg_.poses.back();
-        double dx = ps.pose.position.x - last.pose.position.x;
-        double dy = ps.pose.position.y - last.pose.position.y;
-        double dist_xy = std::sqrt(dx*dx + dy*dy);
-        uint64_t prev_ns = uint64_t(last.header.stamp.sec) * 1000000000ULL + uint64_t(last.header.stamp.nanosec);
-        uint64_t cur_ns  = uint64_t(ps.header.stamp.sec) * 1000000000ULL + uint64_t(ps.header.stamp.nanosec);
-        double dt = (cur_ns > prev_ns) ? double(cur_ns - prev_ns) * 1e-9 : 0.0;
+        const double dx = ps.pose.position.x - last.pose.position.x;
+        const double dy = ps.pose.position.y - last.pose.position.y;
+        const double dist_xy = std::sqrt(dx*dx + dy*dy);
+        const uint64_t prev_ns = uint64_t(last.header.stamp.sec) * 1000000000ULL + uint64_t(last.header.stamp.nanosec);
+        const uint64_t cur_ns  = uint64_t(ps.header.stamp.sec) * 1000000000ULL + uint64_t(ps.header.stamp.nanosec);
+        const double dt = (cur_ns > prev_ns) ? double(cur_ns - prev_ns) * 1e-9 : 0.0;
         if (dist_xy >= min_dist_xy || dt >= min_dt) push = true;
       }
       if (push) {
-        // clamp huge z jumps for path continuity
         if (!path_msg_.poses.empty()) {
-          double last_z = path_msg_.poses.back().pose.position.z;
+          const double last_z = path_msg_.poses.back().pose.position.z;
           const double MAX_PATH_Z_JUMP = 100.0;
-          double dz = ps.pose.position.z - last_z;
+          const double dz = ps.pose.position.z - last_z;
           if (std::abs(dz) > MAX_PATH_Z_JUMP) {
-            double sign = (dz > 0.0) ? 1.0 : -1.0;
-            double clamped_z = last_z + sign * MAX_PATH_Z_JUMP;
+            ps.pose.position.z = last_z + (dz > 0.0 ? MAX_PATH_Z_JUMP : -MAX_PATH_Z_JUMP);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-              "Clamping path point z from %.3f to %.3f (dz=%.3f > %g)", ps.pose.position.z, clamped_z, dz, MAX_PATH_Z_JUMP);
-            ps.pose.position.z = clamped_z;
+              "Clamping path point z jump.");
           }
         }
         path_msg_.poses.push_back(ps);
@@ -746,14 +671,10 @@ private:
       }
     } else {
       if (suppress_tf_and_path) {
-        RCLCPP_DEBUG(this->get_logger(), "Skipping path append due to suppressed publishing (abnormal state).");
+        RCLCPP_DEBUG(this->get_logger(), "Skipping path append due to suppressed publishing.");
       } else if (used_fallback) {
         RCLCPP_DEBUG(this->get_logger(), "Skipping path append because fallback was used.");
       }
-    }
-
-    if (used_fallback && !suppress_tf_and_path) {
-      RCLCPP_DEBUG(this->get_logger(), "publishState used fallback ENU (%g,%g,%g)", pub_pos.x(), pub_pos.y(), pub_pos.z());
     }
   }
 
@@ -772,9 +693,10 @@ private:
   std::string imu_units_{"si"};
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  bool publish_tf_{true};
 
   // conversion helpers / fallback
-  Eigen::Vector3d init_blh_rad_{0,0,0}; // stored initial lat/lon/h in radians (h in meters)
+  Eigen::Vector3d init_blh_rad_{0,0,0}; // 初始经纬高（rad,rad,m）
   Eigen::Vector3d last_valid_enu_{0,0,0};
   bool have_last_valid_{false};
 

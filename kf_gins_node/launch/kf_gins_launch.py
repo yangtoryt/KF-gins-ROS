@@ -16,6 +16,7 @@ def generate_launch_description():
             package='kf_gins_node',
             executable='kf_gins_ros2_node',
             name='kf_gins_ros2_node',
+            remappings=[('/gps/fix', '/gps/fix_cov')],
             parameters=[config],
             output='screen',
             arguments=['--log-level', 'kf_gins_node:info']

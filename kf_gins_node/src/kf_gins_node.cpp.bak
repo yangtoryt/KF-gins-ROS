@@ -1,5 +1,7 @@
-// src/kf_gins_node.cpp (robust version with TF broadcaster, Path publish, and coord auto-detect)
-// Prioritize path z and clamp odom/tf z to avoid huge vertical teleports that ruin RViz view.
+// src/kf_gins_node.cpp  (clean/strong-guard + dataset-time + step-limit)
+// - 与上一版一致：state_pos_mode / z_strategy / SLERP / clamp / Path transient_local
+// - 仅新增：use_dataset_time（默认true）、max_xy_step_m（单步XY限幅，默认30m）
+// - 默认 imu_is_increment=true 以匹配你的播放器：angular_velocity=dtheta[rad], linear_acceleration=dvel[m/s]
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -17,10 +19,6 @@
 #include <string>
 #include <cmath>
 #include <limits>
-#include <algorithm>
-
-#include "ament_index_cpp/get_package_share_directory.hpp"
-#include "rclcpp/parameter_events_filter.hpp"
 
 // TF
 #include <tf2_ros/transform_broadcaster.h>
@@ -32,23 +30,25 @@ static inline bool finite3(const Eigen::Vector3d &v) {
   return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
 }
 
+// BLH (rad,m) -> ECEF (m)
 static void blhToEcef(double lat, double lon, double h, Eigen::Vector3d &ecef) {
   const double a = 6378137.0;
   const double f = 1.0 / 298.257223563;
   const double e2 = f * (2.0 - f);
-  double sLat = sin(lat), cLat = cos(lat);
-  double sLon = sin(lon), cLon = cos(lon);
-  double N = a / sqrt(1.0 - e2 * sLat * sLat);
+  const double sLat = std::sin(lat), cLat = std::cos(lat);
+  const double sLon = std::sin(lon), cLon = std::cos(lon);
+  const double N = a / std::sqrt(1.0 - e2 * sLat * sLat);
   ecef.x() = (N + h) * cLat * cLon;
   ecef.y() = (N + h) * cLat * sLon;
   ecef.z() = (N * (1.0 - e2) + h) * sLat;
 }
 
+// ECEF->ENU rotation at (lat0,lon0) (rad)
 static Eigen::Matrix3d ecefToEnuRot(double lat0, double lon0) {
-  double sLat = sin(lat0), cLat = cos(lat0);
-  double sLon = sin(lon0), cLon = cos(lon0);
+  const double sLat = std::sin(lat0), cLat = std::cos(lat0);
+  const double sLon = std::sin(lon0), cLon = std::cos(lon0);
   Eigen::Matrix3d R;
-  R << -sLon,         cLon,         0,
+  R << -sLon,         cLon,        0,
        -cLon*sLat, -sLon*sLat,  cLat,
         cLon*cLat,  sLon*cLat,  sLat;
   return R;
@@ -58,238 +58,163 @@ class KfGinsNode : public rclcpp::Node {
 public:
   KfGinsNode()
   : Node("kf_gins_ros2_node"), last_imu_time_(-1.0) {
-    // ------------ 参数声明（ YAML 对齐） ------------
+
+    // -------- 保持与上一版一致的参数 --------
     this->declare_parameter<std::string>("imupath", "");
     this->declare_parameter<std::string>("gnsspath", "");
     this->declare_parameter<std::string>("outputpath", "");
+
     this->declare_parameter<int>("imudatalen", 7);
     this->declare_parameter<int>("imudatarate", 200);
     this->declare_parameter<double>("starttime", 0.0);
     this->declare_parameter<double>("endtime", -1.0);
 
-    this->declare_parameter<std::vector<double>>("initpos", {0.0, 0.0, 0.0}); // deg,deg,h(m)
-    this->declare_parameter<std::vector<double>>("initvel", {0.0, 0.0, 0.0}); // m/s
-    this->declare_parameter<std::vector<double>>("initatt", {0.0, 0.0, 0.0}); // deg
+    this->declare_parameter<std::vector<double>>("initpos", {0.0, 0.0, 0.0}); // [deg,deg,m]
+    this->declare_parameter<std::vector<double>>("initvel", {0.0, 0.0, 0.0});
+    this->declare_parameter<std::vector<double>>("initatt", {0.0, 0.0, 0.0}); // [deg]
 
-    this->declare_parameter<std::vector<double>>("initgyrbias", {0.0, 0.0, 0.0}); // deg/h
-    this->declare_parameter<std::vector<double>>("initaccbias", {0.0, 0.0, 0.0}); // 1e-5 g
-    this->declare_parameter<std::vector<double>>("initgyrscale", {0.0, 0.0, 0.0});
-    this->declare_parameter<std::vector<double>>("initaccscale", {0.0, 0.0, 0.0});
+    this->declare_parameter<std::vector<double>>("initgyrbias", {0.0,0.0,0.0}); // [deg/h]
+    this->declare_parameter<std::vector<double>>("initaccbias", {0.0,0.0,0.0}); // [mGal]
+    this->declare_parameter<std::vector<double>>("initgyrscale",{0.0,0.0,0.0});
+    this->declare_parameter<std::vector<double>>("initaccscale",{0.0,0.0,0.0});
 
-    this->declare_parameter<std::vector<double>>("initposstd", {1.0, 1.0, 1.0}); // m
-    this->declare_parameter<std::vector<double>>("initvelstd", {0.1, 0.1, 0.1}); // m/s
-    this->declare_parameter<std::vector<double>>("initattstd", {0.1, 0.1, 0.1}); // deg
+    this->declare_parameter<std::vector<double>>("initposstd",{1.0,1.0,1.0});
+    this->declare_parameter<std::vector<double>>("initvelstd",{0.1,0.1,0.1});
+    this->declare_parameter<std::vector<double>>("initattstd",{0.1,0.1,0.1});
 
-    this->declare_parameter<std::vector<double>>("imunoise.arw",  {0.003, 0.003, 0.003});
-    this->declare_parameter<std::vector<double>>("imunoise.vrw",  {0.03, 0.03, 0.03});
-    this->declare_parameter<std::vector<double>>("imunoise.gbstd",{0.027, 0.027, 0.027});
-    this->declare_parameter<std::vector<double>>("imunoise.abstd",{15.0, 15.0, 15.0});
-    this->declare_parameter<std::vector<double>>("imunoise.gsstd",{300.0, 300.0, 300.0});
-    this->declare_parameter<std::vector<double>>("imunoise.asstd",{300.0, 300.0, 300.0});
+    this->declare_parameter<std::vector<double>>("imunoise.arw",  {0.003,0.003,0.003});
+    this->declare_parameter<std::vector<double>>("imunoise.vrw",  {0.03,0.03,0.03});
+    this->declare_parameter<std::vector<double>>("imunoise.gbstd",{0.027,0.027,0.027});
+    this->declare_parameter<std::vector<double>>("imunoise.abstd",{0.05,0.05,0.05});
+    this->declare_parameter<std::vector<double>>("imunoise.gsstd",{500,500,500});
+    this->declare_parameter<std::vector<double>>("imunoise.asstd",{500,500,500});
     this->declare_parameter<double>("imunoise.corrtime", 4.0);
 
     this->declare_parameter<std::string>("imu_topic", "/imu/data");
     this->declare_parameter<std::string>("gps_topic", "/gps/fix");
+    this->declare_parameter<std::vector<double>>("antlever", {0.0,0.0,0.0});
 
-    this->declare_parameter<std::vector<double>>("antlever", {0.0, 0.0, 0.0});
+    // IMU 解释：默认改为 true 以匹配你的播放器（dtheta/dvel）
+    this->declare_parameter<bool>("imu_is_increment", true);
+    this->declare_parameter<std::string>("imu_units", "si");   // "si" or "deg_g"
 
-    // 新增：IMU 话题是否为增量、IMU 单位
-    this->declare_parameter<bool>("imu_is_increment", true); // 默认按 ROS 标准：速率/加速度
-    this->declare_parameter<std::string>("imu_units", "si");  // "si" 或 "deg_g"
+    // 位置解释、Z策略与 TF
+    this->declare_parameter<std::string>("state_pos_mode", "enu"); // "enu"|"ecef"|"blh_rad"|"blh_deg"|"auto"
+    this->declare_parameter<std::string>("z_strategy", "init_alt"); // "zero"|"init_alt"|"raw_clamped"
+    this->declare_parameter<bool>("publish_tf", true);
 
-    std::string pkg_path = ament_index_cpp::get_package_share_directory("kf_gins_node");
-    std::string imu_path, gps_path;
-    this->get_parameter("imupath", imu_path);
-    this->get_parameter("gnsspath", gps_path);
-    std::string full_imu_path = pkg_path + "/" + imu_path;
-    std::string full_gps_path = pkg_path + "/" + gps_path;
+    // 平滑/防护
+    this->declare_parameter<double>("orientation_slerp_alpha", 0.2);
+    this->declare_parameter<double>("clamp_xy_max_m", 5e5);      // 500 km guard
+    this->declare_parameter<double>("clamp_z_band_m", 2000.0);   // +/- around init_alt
+    this->declare_parameter<double>("smooth_z_step_m", 50.0);    // step if dz too large
+    this->declare_parameter<int>("path_max_len", 50000);
 
-    // ------------ 读参数填 options ------------
+    // **新增**：使用数据时间戳 & 单步XY限幅
+    this->declare_parameter<bool>("use_dataset_time", true);
+    this->declare_parameter<double>("max_xy_step_m", 30.0);
+
+    // --------- Build options for GIEngine ---------
     GINSOptions options;
     std::vector<double> v;
 
-    options.initstate_std.pos   = Eigen::Vector3d(1.0, 1.0, 1.0);
-    options.initstate_std.vel   = Eigen::Vector3d(0.1, 0.1, 0.1);
-    options.initstate_std.euler = Eigen::Vector3d(0.1 * D2R, 0.1 * D2R, 0.1 * D2R);
-    options.initstate_std.imuerror.gyrbias  = Eigen::Vector3d(1e-6, 1e-6, 1e-6);
-    options.initstate_std.imuerror.accbias  = Eigen::Vector3d(1e-4, 1e-4, 1e-4);
-    options.initstate_std.imuerror.gyrscale = Eigen::Vector3d(1e-6, 1e-6, 1e-6);
-    options.initstate_std.imuerror.accscale = Eigen::Vector3d(1e-6, 1e-6, 1e-6);
+    options.initstate_std.pos   = Eigen::Vector3d(1,1,1);
+    options.initstate_std.vel   = Eigen::Vector3d(0.1,0.1,0.1);
+    options.initstate_std.euler = Eigen::Vector3d(0.1*D2R,0.1*D2R,0.1*D2R);
+    options.initstate_std.imuerror.gyrbias  = Eigen::Vector3d(1e-6,1e-6,1e-6);
+    options.initstate_std.imuerror.accbias  = Eigen::Vector3d(1e-4,1e-4,1e-4);
+    options.initstate_std.imuerror.gyrscale = Eigen::Vector3d(1e-6,1e-6,1e-6);
+    options.initstate_std.imuerror.accscale = Eigen::Vector3d(1e-6,1e-6,1e-6);
 
-    if (this->get_parameter("initposstd", v) && v.size() >= 3)
-      options.initstate_std.pos = Eigen::Vector3d(v[0], v[1], v[2]);
-    if (this->get_parameter("initvelstd", v) && v.size() >= 3)
-      options.initstate_std.vel = Eigen::Vector3d(v[0], v[1], v[2]);
-    if (this->get_parameter("initattstd", v) && v.size() >= 3)
-      options.initstate_std.euler = Eigen::Vector3d(v[0]*D2R, v[1]*D2R, v[2]*D2R);
+    int imudatarate = 200; this->get_parameter("imudatarate", imudatarate); imudatarate_ = imudatarate;
 
-    int imudatarate = 200;
-    this->get_parameter("imudatarate", imudatarate);
-    imudatarate_ = imudatarate;
-
-    if (this->get_parameter("initpos", v) && v.size() >= 3) {
-      // store initpos in radians internally (lat, lon in rad)
-      options.initstate.pos[0] = v[0] * D2R;
-      options.initstate.pos[1] = v[1] * D2R;
-      options.initstate.pos[2] = v[2];
-    } else {
-      RCLCPP_ERROR(this->get_logger(), "Failed to load initpos");
+    if (this->get_parameter("initpos", v) && v.size()>=3) {
+      init_blh_rad_[0] = v[0]*D2R;
+      init_blh_rad_[1] = v[1]*D2R;
+      init_blh_rad_[2] = v[2];
+      options.initstate.pos = init_blh_rad_;
     }
-    if (this->get_parameter("initvel", v) && v.size() >= 3) {
-      options.initstate.vel = Eigen::Vector3d(v[0], v[1], v[2]);
-    }
-    if (this->get_parameter("initatt", v) && v.size() >= 3) {
-      options.initstate.euler = Eigen::Vector3d(v[0]*D2R, v[1]*D2R, v[2]*D2R);
-    }
+    if (this->get_parameter("initvel", v) && v.size()>=3) options.initstate.vel = {v[0],v[1],v[2]};
+    if (this->get_parameter("initatt", v) && v.size()>=3) options.initstate.euler = {v[0]*D2R,v[1]*D2R,v[2]*D2R};
 
-    if (this->get_parameter("initgyrbias", v) && v.size() >= 3) {
-      options.initstate.imuerror.gyrbias = Eigen::Vector3d(
-        v[0]*D2R/3600.0, v[1]*D2R/3600.0, v[2]*D2R/3600.0);
-    }
-    if (this->get_parameter("initaccbias", v) && v.size() >= 3) {
-      options.initstate.imuerror.accbias = Eigen::Vector3d(
-        v[0]*1e-5, v[1]*1e-5, v[2]*1e-5);
-    }
-    if (this->get_parameter("initgyrscale", v) && v.size() >= 3) {
-      options.initstate.imuerror.gyrscale = Eigen::Vector3d(v[0], v[1], v[2]);
-    }
-    if (this->get_parameter("initaccscale", v) && v.size() >= 3) {
-      options.initstate.imuerror.accscale = Eigen::Vector3d(v[0], v[1], v[2]);
-    }
+    if (this->get_parameter("initgyrbias", v) && v.size()>=3)
+      options.initstate.imuerror.gyrbias = {v[0]*D2R/3600.0, v[1]*D2R/3600.0, v[2]*D2R/3600.0};
+    if (this->get_parameter("initaccbias", v) && v.size()>=3)
+      options.initstate.imuerror.accbias = {v[0]*1e-5, v[1]*1e-5, v[2]*1e-5};
+    if (this->get_parameter("initgyrscale", v) && v.size()>=3)
+      options.initstate.imuerror.gyrscale = {v[0],v[1],v[2]};
+    if (this->get_parameter("initaccscale", v) && v.size()>=3)
+      options.initstate.imuerror.accscale = {v[0],v[1],v[2]};
+    if (this->get_parameter("antlever", v) && v.size()>=3) options.antlever = {v[0],v[1],v[2]};
 
-    if (this->get_parameter("antlever", v) && v.size() >= 3) {
-      options.antlever = Eigen::Vector3d(v[0], v[1], v[2]);
-    }
-    const double DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC = M_PI / 180.0 / sqrt(3600.0);
-    if (this->get_parameter("imunoise.arw", v) && v.size() >= 3)
-      options.imunoise.gyr_arw = Eigen::Vector3d(
-        v[0] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC,
-        v[1] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC,
-        v[2] * DEG_PER_SQRT_HOUR_TO_RAD_PER_SQRT_SEC
-      );
-    const double MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC = 1.0 / sqrt(3600.0);
-    if (this->get_parameter("imunoise.vrw", v) && v.size() >= 3)
-      options.imunoise.acc_vrw = Eigen::Vector3d(
-        v[0] * MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC,
-        v[1] * MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC,
-        v[2] * MPS_PER_SQRT_HOUR_TO_MPS_PER_SQRT_SEC
-      );
-    const double DEG_PER_HOUR_TO_RAD_PER_SEC = M_PI / 180.0 / 3600.0;
-    if (this->get_parameter("imunoise.gbstd", v) && v.size() >= 3)
-      options.imunoise.gyrbias_std = Eigen::Vector3d(
-        v[0] * DEG_PER_HOUR_TO_RAD_PER_SEC,
-        v[1] * DEG_PER_HOUR_TO_RAD_PER_SEC,
-        v[2] * DEG_PER_HOUR_TO_RAD_PER_SEC
-      );
-    const double MILLIGAL_TO_MPS2 = 1e-5;
-    if (this->get_parameter("imunoise.abstd", v) && v.size() >= 3)
-      options.imunoise.accbias_std = Eigen::Vector3d(
-        v[0] * MILLIGAL_TO_MPS2,
-        v[1] * MILLIGAL_TO_MPS2,
-        v[2] * MILLIGAL_TO_MPS2
-      );
+    // noise unit convert
+    const double DEG_SQH_2_RAD_SQS = M_PI/180.0/std::sqrt(3600.0);
+    const double MPS_SQH_2_MPS_SQS = 1.0/std::sqrt(3600.0);
+    const double DEG_H_2_RAD_S     = M_PI/180.0/3600.0;
+    const double MGAL_2_MPS2       = 1e-5;
+    if (this->get_parameter("imunoise.arw", v) && v.size()>=3)
+      options.imunoise.gyr_arw = {v[0]*DEG_SQH_2_RAD_SQS, v[1]*DEG_SQH_2_RAD_SQS, v[2]*DEG_SQH_2_RAD_SQS};
+    if (this->get_parameter("imunoise.vrw", v) && v.size()>=3)
+      options.imunoise.acc_vrw = {v[0]*MPS_SQH_2_MPS_SQS, v[1]*MPS_SQH_2_MPS_SQS, v[2]*MPS_SQH_2_MPS_SQS};
+    if (this->get_parameter("imunoise.gbstd", v) && v.size()>=3)
+      options.imunoise.gyrbias_std = {v[0]*DEG_H_2_RAD_S, v[1]*DEG_H_2_RAD_S, v[2]*DEG_H_2_RAD_S};
+    if (this->get_parameter("imunoise.abstd", v) && v.size()>=3)
+      options.imunoise.accbias_std = {v[0]*MGAL_2_MPS2, v[1]*MGAL_2_MPS2, v[2]*MGAL_2_MPS2};
+    if (this->get_parameter("imunoise.gsstd", v) && v.size()>=3) options.imunoise.gyrscale_std = {v[0],v[1],v[2]};
+    if (this->get_parameter("imunoise.asstd", v) && v.size()>=3) options.imunoise.accscale_std = {v[0],v[1],v[2]};
+    double corr=4.0; this->get_parameter("imunoise.corrtime", corr); options.imunoise.corr_time = corr;
 
-    if (this->get_parameter("imunoise.gsstd", v) && v.size() >= 3)
-      options.imunoise.gyrscale_std = Eigen::Vector3d(v[0], v[1], v[2]);
-    if (this->get_parameter("imunoise.asstd", v) && v.size() >= 3)
-      options.imunoise.accscale_std = Eigen::Vector3d(v[0], v[1], v[2]);
-
-    double corr = 4.0;
-    this->get_parameter("imunoise.corrtime", corr);
-    options.imunoise.corr_time = corr;
-
-    if (imudatarate <= 0 || imudatarate > 2000) {
-      RCLCPP_ERROR(this->get_logger(), "imudatarate must be 1~2000");
-      rclcpp::shutdown();
-    }
-
-    if (this->get_parameter("initpos", v) && v.size() >= 2) {
-      if (v[0] < -90 || v[0] > 90 || v[1] < -180 || v[1] > 180) {
-        RCLCPP_ERROR(this->get_logger(), "initpos (lat/lon) out of range");
-        rclcpp::shutdown();
-      }
-    }
-
-    auto check_positive = [this](const std::vector<double> &v, const std::string &name) {
-      for (double val : v) {
-        if (val <= 0) {
-          RCLCPP_ERROR(this->get_logger(), "%s must be positive", name.c_str());
-          rclcpp::shutdown();
-        }
-      }
-    };
-    if (this->get_parameter("imunoise.arw", v)) check_positive(v, "imunoise.arw");
-
+    // switches
     this->get_parameter("imu_is_increment", imu_is_increment_);
     this->get_parameter("imu_units", imu_units_);
+    this->get_parameter("state_pos_mode", state_pos_mode_);
+    this->get_parameter("z_strategy", z_strategy_);
+    this->get_parameter("publish_tf", publish_tf_);
+    this->get_parameter("orientation_slerp_alpha", orientation_slerp_alpha_);
+    this->get_parameter("clamp_xy_max_m", clamp_xy_max_m_);
+    this->get_parameter("clamp_z_band_m", clamp_z_band_m_);
+    this->get_parameter("smooth_z_step_m", smooth_z_step_m_);
+    this->get_parameter("path_max_len", path_max_len_);
+    this->get_parameter("use_dataset_time", use_dataset_time_);
+    this->get_parameter("max_xy_step_m", max_xy_step_m_);
 
-    RCLCPP_INFO(this->get_logger(), "Loaded imu_is_increment from config: %s",
-                imu_is_increment_ ? "true" : "false");
-    RCLCPP_INFO(this->get_logger(), "Final imu_is_increment = %s, imu_units = %s",
-                imu_is_increment_ ? "true" : "false", imu_units_.c_str());
+    RCLCPP_INFO(this->get_logger(),
+      "Final imu_is_increment=%s, imu_units=%s | state_pos_mode=%s, z_strategy=%s, publish_tf=%s, use_dataset_time=%s",
+      imu_is_increment_?"true":"false", imu_units_.c_str(),
+      state_pos_mode_.c_str(), z_strategy_.c_str(), publish_tf_?"true":"false",
+      use_dataset_time_?"true":"false");
 
-    auto sanitize_vec3 = [](Eigen::Vector3d &v, const Eigen::Vector3d &fallback){
-        for (int i=0;i<3;++i) if (!std::isfinite(v[i])) v[i] = fallback[i];
-    };
-    Eigen::Vector3d zero3 = Eigen::Vector3d::Zero();
-    sanitize_vec3(options.initstate.pos, zero3);
-    sanitize_vec3(options.initstate.vel, zero3);
-    sanitize_vec3(options.initstate.euler, zero3);
-    sanitize_vec3(options.initstate.imuerror.gyrbias, zero3);
-    sanitize_vec3(options.initstate.imuerror.accbias, zero3);
-    sanitize_vec3(options.initstate.imuerror.gyrscale, zero3);
-    sanitize_vec3(options.initstate.imuerror.accscale, zero3);
-
-    RCLCPP_INFO(this->get_logger(), "Sanitized initstate pos=%g %g %g", options.initstate.pos[0], options.initstate.pos[1], options.initstate.pos[2]);
-    RCLCPP_INFO(this->get_logger(), "Sanitized initstate vel=%g %g %g", options.initstate.vel[0], options.initstate.vel[1], options.initstate.vel[2]);
-    RCLCPP_INFO(this->get_logger(), "Sanitized initstate euler=%g %g %g (rad)", options.initstate.euler[0], options.initstate.euler[1], options.initstate.euler[2]);
-    RCLCPP_INFO(this->get_logger(), "Sanitized imuerror gyrbias=%g %g %g", options.initstate.imuerror.gyrbias[0], options.initstate.imuerror.gyrbias[1], options.initstate.imuerror.gyrbias[2]);
-
-    // Print options if available
     options.print_options();
 
-    // ------------ 创建引擎 ------------
+    // -------- Engine --------
     engine_ = std::make_shared<GIEngine>(options);
 
-    // ------------ 订阅与发布 ------------
+    // -------- IO --------
     std::string imu_topic = this->get_parameter("imu_topic").as_string();
     imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
       imu_topic, rclcpp::SensorDataQoS(),
-      std::bind(&KfGinsNode::imuCallback, this, _1)
-    );
+      std::bind(&KfGinsNode::imuCallback, this, _1));
 
     std::string gps_topic = this->get_parameter("gps_topic").as_string();
     gps_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-      gps_topic, 10, std::bind(&KfGinsNode::gpsCallback, this, _1)
-    );
-
-    auto param_callback = [this](const std::vector<rclcpp::Parameter> &params) {
-      rcl_interfaces::msg::SetParametersResult result;
-      result.successful = true;
-      result.reason = "";
-      return result;
-    };
-    param_sub_ = this->add_on_set_parameters_callback(param_callback);
+      gps_topic, 10, std::bind(&KfGinsNode::gpsCallback, this, _1));
 
     odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/kf_gins/odom", 10);
 
-    // Path
-    path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/kf_gins/path", 10);
+    // Path 使用 transient_local 让 RViz 后启动也能见到历史
+    rclcpp::QoS path_qos(rclcpp::KeepLast(1000));
+    path_qos.transient_local().reliable();
+    path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/kf_gins/path", path_qos);
     path_msg_.header.frame_id = "map";
     path_msg_.poses.clear();
 
-    // store initial BLH (radians)
-    init_blh_rad_ = options.initstate.pos;
-    have_last_valid_ = false;
+    if (publish_tf_) tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
-    // TF broadcaster
-    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
-
-    RCLCPP_INFO(this->get_logger(), "KF-GINS ROS2 Node initialized (imu_is_increment=%s, imu_units=%s)",
-                imu_is_increment_ ? "true" : "false", imu_units_.c_str());
+    RCLCPP_INFO(this->get_logger(), "KF-GINS ROS2 Node initialized.");
   }
 
 private:
+  // ---------- helpers ----------
   static bool navstateHasInvalid(const NavState &s) {
     for (int i = 0; i < 3; ++i) {
       if (!std::isfinite(s.pos[i]) || !std::isfinite(s.vel[i]) || !std::isfinite(s.euler[i])) return true;
@@ -299,27 +224,53 @@ private:
     return false;
   }
 
+  // 将 engine 的 state.pos 依照 state_pos_mode_ 统一转为 ENU(m)
+  bool toENU(const Eigen::Vector3d &state_pos, Eigen::Vector3d &enu_out) {
+    if (!finite3(state_pos)) return false;
+    const auto &p = state_pos;
+    if (state_pos_mode_ == "enu") { enu_out = p; return finite3(enu_out); }
+
+    Eigen::Vector3d ecef_ref; blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
+    Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
+
+    if (state_pos_mode_ == "ecef") {
+      enu_out = R * (p - ecef_ref); return finite3(enu_out);
+    }
+    if (state_pos_mode_ == "blh_rad") {
+      Eigen::Vector3d ecef; blhToEcef(p[0], p[1], p[2], ecef); enu_out = R * (ecef - ecef_ref); return finite3(enu_out);
+    }
+    if (state_pos_mode_ == "blh_deg") {
+      Eigen::Vector3d ecef; blhToEcef(p[0]*M_PI/180.0, p[1]*M_PI/180.0, p[2], ecef); enu_out = R * (ecef - ecef_ref); return finite3(enu_out);
+    }
+    // auto: 粗判 ECEF 范数
+    if (state_pos_mode_ == "auto") {
+      double norm = p.norm();
+      if (norm > 3e6 && norm < 1.2e7) enu_out = R * (p - ecef_ref);
+      else enu_out = p;
+      return finite3(enu_out);
+    }
+    return false;
+  }
+
   void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
     IMU imu_data;
-    const double cur_time = double(msg->header.stamp.sec) + double(msg->header.stamp.nanosec) * 1e-9;
-    imu_data.time = cur_time;
+    const double t = double(msg->header.stamp.sec) + double(msg->header.stamp.nanosec)*1e-9;
+    imu_data.time = t;
 
-    double dt = 0.0;
-    if (last_imu_time_ < 0.0) {
-      dt = 1.0 / std::max(1, imudatarate_);
-    } else {
-      dt = cur_time - last_imu_time_;
-      if (!(dt > 0.0) || !std::isfinite(dt)) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "IMU dt invalid: %.9f, fallback to %g", dt, 1.0/std::max(1, imudatarate_));
-        dt = 1.0 / std::max(1, imudatarate_);
-      }
+    // 记录最近一次传感器时间戳，供发布用
+    last_sensor_stamp_ = msg->header.stamp;
+
+    double dt;
+    if (last_imu_time_ < 0.0) dt = 1.0 / std::max(1, imudatarate_);
+    else {
+      dt = t - last_imu_time_;
+      if (!(dt > 0.0) || !std::isfinite(dt)) dt = 1.0 / std::max(1, imudatarate_);
       if (dt < 1e-6) dt = 1e-6;
-      if (dt > 0.2) dt = 0.2;
+      if (dt > 0.2)  dt = 0.2;
     }
-    imu_data.dt = dt;
-    last_imu_time_ = cur_time;
+    imu_data.dt = dt; last_imu_time_ = t;
 
+    // 你的播放器：angular_velocity= dtheta[rad], linear_acceleration= dvel[m/s]
     double wx = msg->angular_velocity.x;
     double wy = msg->angular_velocity.y;
     double wz = msg->angular_velocity.z;
@@ -328,44 +279,25 @@ private:
     double az = msg->linear_acceleration.z;
 
     if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz) ||
-        !std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az)) {
-      RCLCPP_WARN(this->get_logger(), "IMU ROS message contains non-finite values, dropping sample. stamp=%.9f", cur_time);
-      return;
-    }
+        !std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az)) return;
 
-    if (imu_units_ == "deg_g") {
-      const double DEG2RAD = M_PI / 180.0;
+    if (imu_units_ == "deg_g") { // 兼容旧数据
+      const double DEG2RAD = M_PI/180.0;
       const double G2MS2   = 9.81;
-      wx *= DEG2RAD; wy *= DEG2RAD; wz *= DEG2RAD;
-      ax *= G2MS2;   ay *= G2MS2;   az *= G2MS2;
+      wx*=DEG2RAD; wy*=DEG2RAD; wz*=DEG2RAD;
+      ax*=G2MS2;   ay*=G2MS2;   az*=G2MS2;
     }
 
     if (imu_is_increment_) {
       imu_data.dtheta << wx, wy, wz;
       imu_data.dvel   << ax, ay, az;
     } else {
-      imu_data.dtheta << wx * dt, wy * dt, wz * dt;
-      imu_data.dvel   << ax * dt, ay * dt, az * dt;
+      imu_data.dtheta << wx*dt, wy*dt, wz*dt;
+      imu_data.dvel   << ax*dt, ay*dt, az*dt;
     }
-
-    if (!finite3(imu_data.dtheta) || !finite3(imu_data.dvel)) {
-      RCLCPP_ERROR(this->get_logger(), "Computed dtheta/dvel contain non-finite values, drop sample. stamp=%.9f dt=%g", cur_time, dt);
-      RCLCPP_DEBUG(this->get_logger(), "raw wx,wy,wz = %g %g %g; ax,ay,az = %g %g %g", wx, wy, wz, ax, ay, az);
-      return;
-    }
-
-    RCLCPP_DEBUG(this->get_logger(), "IMU sample stamp=%.6f dt=%.6g dtheta=[%.8g, %.8g, %.8g] dvel=[%.8g, %.8g, %.8g]",
-                 imu_data.time, imu_data.dt,
-                 imu_data.dtheta.x(), imu_data.dtheta.y(), imu_data.dtheta.z(),
-                 imu_data.dvel.x(), imu_data.dvel.y(), imu_data.dvel.z());
+    if (!finite3(imu_data.dtheta) || !finite3(imu_data.dvel)) return;
 
     imu_data.odovel = 0.0;
-
-    if (!engine_) {
-      RCLCPP_ERROR(this->get_logger(), "engine_ is null, cannot process IMU");
-      return;
-    }
-
     engine_->addImuData(imu_data, true);
     engine_->newImuProcess();
 
@@ -373,354 +305,206 @@ private:
   }
 
   void gpsCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
-    GNSS gnss_data;
-    gnss_data.time = double(msg->header.stamp.sec) + double(msg->header.stamp.nanosec) * 1e-9;
-    gnss_data.blh  << msg->latitude, msg->longitude, msg->altitude;
-    gnss_data.std  << 1.0, 1.0, 3.0;
-    gnss_data.isvalid = std::isfinite(gnss_data.blh.x()) && std::isfinite(gnss_data.blh.y()) && std::isfinite(gnss_data.blh.z());
+    GNSS g;
+    g.time = double(msg->header.stamp.sec) + double(msg->header.stamp.nanosec)*1e-9;
+    g.blh  << msg->latitude, msg->longitude, msg->altitude;
+    g.std  << 1.0, 1.0, 3.0;
+    g.isvalid = std::isfinite(g.blh[0]) && std::isfinite(g.blh[1]) && std::isfinite(g.blh[2]);
+    engine_->addGnssData(g);
 
-    engine_->addGnssData(gnss_data);
+    last_sensor_stamp_ = msg->header.stamp;
     publishState();
   }
 
   void publishState() {
-    NavState state = engine_->getNavState();
-
-    if (navstateHasInvalid(state)) {
-      RCLCPP_ERROR(this->get_logger(), "NavState contains NaN/Inf! Skipping publish and dumping debug info.");
-      RCLCPP_ERROR(this->get_logger(), "last_imu_time=%.6f", last_imu_time_);
-      if (engine_) {
-        RCLCPP_WARN(this->get_logger(), "GIEngine::debugDump() not invoked (may not be available in this build).");
-      }
+    const NavState s = engine_->getNavState();
+    if (navstateHasInvalid(s)) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "NavState contains NaN/Inf, skip.");
       return;
     }
 
-    // build timestamp once
-    rclcpp::Time now_rcl = this->get_clock()->now();
-    uint64_t now_ns = now_rcl.nanoseconds();
-    int32_t sec = static_cast<int32_t>(now_ns / 1000000000ULL);
-    uint32_t nanosec = static_cast<uint32_t>(now_ns % 1000000000ULL);
-
-    // Determine what state.pos represents and convert to local ENU meters (pub_pos)
-    Eigen::Vector3d pub_pos = state.pos; // default assume ENU
-    bool converted = false;
-    std::string detected = "unknown";
-
-    if (std::isfinite(state.pos[0]) && std::isfinite(state.pos[1]) && std::isfinite(state.pos[2])) {
-      double ax = std::abs(state.pos[0]), ay = std::abs(state.pos[1]), az = std::abs(state.pos[2]);
-      if (ax < 1e5 && ay < 1e5 && az < 2e4) {
-        // likely ENU (meters)
-        converted = true;
-        detected = "enu";
-        pub_pos = state.pos;
-      } else {
-        // BLH in radians?
-        if (std::abs(state.pos[0]) <= 1.2 && std::abs(state.pos[1]) <= 1.2 && std::abs(state.pos[2]) < 1e5) {
-          Eigen::Vector3d ecef, ecef_ref;
-          blhToEcef(state.pos[0], state.pos[1], state.pos[2], ecef);
-          blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
-          Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
-          pub_pos = R * (ecef - ecef_ref);
-          converted = true;
-          detected = "blh_rad";
-          RCLCPP_DEBUG(this->get_logger(), "publishState: treated state.pos as BLH (rad).");
-        }
-        // BLH in degrees?
-        else if (std::abs(state.pos[0]) <= 180.0 && std::abs(state.pos[1]) <= 180.0 && std::abs(state.pos[2]) < 1e5) {
-          double lat_rad = state.pos[0] * M_PI / 180.0;
-          double lon_rad = state.pos[1] * M_PI / 180.0;
-          Eigen::Vector3d ecef, ecef_ref;
-          blhToEcef(lat_rad, lon_rad, state.pos[2], ecef);
-          blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
-          Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
-          pub_pos = R * (ecef - ecef_ref);
-          converted = true;
-          detected = "blh_deg";
-          RCLCPP_DEBUG(this->get_logger(), "publishState: treated state.pos as BLH (deg).");
-        }
-        // ECEF?
-        else {
-          double norm = state.pos.norm();
-          if ((norm > 3.0e6 && norm < 1.2e7) ||
-              std::abs(state.pos[0]) > 1e6 || std::abs(state.pos[1]) > 1e6 || std::abs(state.pos[2]) > 1e6) {
-            Eigen::Vector3d ecef_ref;
-            blhToEcef(init_blh_rad_[0], init_blh_rad_[1], init_blh_rad_[2], ecef_ref);
-            Eigen::Matrix3d R = ecefToEnuRot(init_blh_rad_[0], init_blh_rad_[1]);
-            pub_pos = R * (state.pos - ecef_ref);
-            converted = true;
-            detected = "ecef";
-            RCLCPP_DEBUG(this->get_logger(), "publishState: treated state.pos as ECEF (norm=%g).", norm);
-          } else {
-            detected = "unrecognized";
-            RCLCPP_DEBUG(this->get_logger(), "publishState: state.pos not recognized (abs=%g,%g,%g norm=%g).", ax, ay, az, norm);
-          }
-        }
-      }
+    // -------- stamp：数据时间或系统时间 --------
+    builtin_interfaces::msg::Time stamp{};
+    if (use_dataset_time_ && (last_sensor_stamp_.sec != 0 || last_sensor_stamp_.nanosec != 0)) {
+      stamp = last_sensor_stamp_;
+    } else {
+      auto now = this->get_clock()->now();
+      int64_t ns = now.nanoseconds();
+      stamp.sec = static_cast<int32_t>(ns / 1000000000LL);
+      stamp.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
     }
 
-    // SAFETY/GATING: do not accept absurdly large ENU numbers to publish.
-    bool used_fallback = false;
-    const double MAX_ACCEPT = 5e5; // 500 km guard
-    const double MAX_ALT_DELTA = 2000.0; // +/- 2000 m allowed relative to init altitude
-    const double SMOOTH_Z_DELTA = 50.0; // smoothing step if needed
-    // const double MAX_MATCH_Z_DIFF = 100.0; // if pub_pos.z differs from path_z by > this, clamp to path_z
+    // euler -> quat with SLERP
+    Eigen::AngleAxisd rx(s.euler(0), Eigen::Vector3d::UnitX());
+    Eigen::AngleAxisd ry(s.euler(1), Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd rz(s.euler(2), Eigen::Vector3d::UnitZ());
+    Eigen::Quaterniond q = (rz*ry*rx).normalized();
+    if (have_last_quat_) {
+      if (q.dot(last_quat_) < 0.0) q.coeffs() *= -1.0;
+      q = last_quat_.slerp(orientation_slerp_alpha_, q).normalized();
+    }
+    last_quat_ = q; have_last_quat_ = true;
 
-    double init_alt = init_blh_rad_.z(); // initial altitude (meters)
-    bool publish_raw = true;
+    // pos -> ENU(m)
+    Eigen::Vector3d enu;
+    if (!toENU(s.pos, enu)) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "toENU failed.");
+      return;
+    }
 
-    if (!converted) {
-      publish_raw = false;
-      RCLCPP_DEBUG(this->get_logger(), "publishState: not converted (detected=%s) -> will fallback.", detected.c_str());
-    } else {
-      if (!finite3(pub_pos) ||
-          std::abs(pub_pos.x()) > MAX_ACCEPT || std::abs(pub_pos.y()) > MAX_ACCEPT ||
-          std::abs(pub_pos.z() - init_alt) > MAX_ALT_DELTA) {
-        publish_raw = false;
+    // **单步 XY 限幅**：抑制“瞬移”
+    if (have_last_valid_) {
+      Eigen::Vector2d dxy(enu.x()-last_valid_enu_.x(), enu.y()-last_valid_enu_.y());
+      double step = dxy.norm();
+      if (std::isfinite(step) && step > max_xy_step_m_) {
+        double r = max_xy_step_m_ / step;
+        enu.x() = last_valid_enu_.x() + dxy.x()*r;
+        enu.y() = last_valid_enu_.y() + dxy.y()*r;
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "publishState: converted pub_pos out of bounds (detected=%s) -> will fallback. pub_pos=(%.3f,%.3f,%.3f) init_alt=%.3f",
-          detected.c_str(), pub_pos.x(), pub_pos.y(), pub_pos.z(), init_alt);
+          "XY step limited: %.2f m -> %.2f m", step, max_xy_step_m_);
       }
     }
 
-    // Determine reference_z: prefer latest path point if available, otherwise last_valid or init_alt
-    double reference_z = init_alt;
-    if (!path_msg_.poses.empty()) {
-      reference_z = path_msg_.poses.back().pose.position.z;
-    } else if (have_last_valid_) {
-      reference_z = last_valid_enu_.z();
+    // XY 超范围硬钳
+    if (!finite3(enu) || std::abs(enu.x()) > clamp_xy_max_m_ || std::abs(enu.y()) > clamp_xy_max_m_) {
+      if (have_last_valid_) enu = last_valid_enu_;
+      else enu = Eigen::Vector3d(0,0,init_blh_rad_.z());
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "ENU XY out-of-range clamped.");
     }
 
-    if (!publish_raw) {
-      // fallback to last valid or zero
+    // Z 策略
+    const double init_alt = init_blh_rad_.z();
+    if (z_strategy_ == "zero") {
+      enu.z() = 0.0;
+    } else if (z_strategy_ == "init_alt") {
+      enu.z() = init_alt;
+    } else { // raw_clamped
       if (have_last_valid_) {
-        pub_pos = last_valid_enu_;
-        used_fallback = true;
-      } else {
-        pub_pos = Eigen::Vector3d::Zero();
-        used_fallback = true;
-      }
-    } else {
-      // If we have last valid and z jump is big, do smoothing step to avoid teleport
-      if (have_last_valid_) {
-        double last_z = last_valid_enu_.z();
-        double dz = pub_pos.z() - last_z;
-        if (std::abs(dz) > SMOOTH_Z_DELTA) {
-          double sign = (dz > 0.0) ? 1.0 : -1.0;
-          double newz = last_z + sign * SMOOTH_Z_DELTA;
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Smoothing large z jump: last_z=%.3f new_pub_z(from %.3f->%.3f) applied step=%.3f",
-            last_z, pub_pos.z(), newz, SMOOTH_Z_DELTA);
-          pub_pos.z() = newz;
+        const double dz = enu.z() - last_valid_enu_.z();
+        if (std::abs(dz) > smooth_z_step_m_) {
+          enu.z() = last_valid_enu_.z() + std::copysign(smooth_z_step_m_, dz);
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Z smoothing applied.");
         }
       }
-
-      // ---- NEW STRATEGY: always prefer path z if path exists ----
-      // This enforces odom/z and tf/z to match the path shown in RViz and avoids one-source-high/other-source-low mismatch.
-      if (!path_msg_.poses.empty()) {
-        double oldz = pub_pos.z();
-        pub_pos.z() = reference_z;
-        if (std::abs(pub_pos.z() - oldz) > 0.5) {
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Overriding pub_pos.z (%.3f) with latest path z (%.3f) to keep odom/tf/path consistent.",
-            oldz, pub_pos.z());
-        }
-      } else {
-        // clamp absolute extreme z to safe band around init_alt just in case
-        if (std::abs(pub_pos.z() - init_alt) > MAX_ALT_DELTA) {
-          double clamped = init_alt + std::copysign(MAX_ALT_DELTA, pub_pos.z() - init_alt);
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Clamping pub_pos.z from %.3f to safe band %.3f (init_alt=%.3f)", pub_pos.z(), clamped, init_alt);
-          pub_pos.z() = clamped;
-        }
+      const double dz0 = enu.z() - init_alt;
+      if (!std::isfinite(enu.z()) || std::abs(dz0) > clamp_z_band_m_) {
+        enu.z() = init_alt + std::copysign(clamp_z_band_m_, dz0);
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Z clamped to band.");
       }
-
-      // accept as "last valid"
-      last_valid_enu_ = pub_pos;
-      have_last_valid_ = true;
     }
 
-    // Compose and publish odometry
+    // 保存 last valid
+    last_valid_enu_ = enu; have_last_valid_ = true;
+
+    // -------- Odom --------
     nav_msgs::msg::Odometry odom;
-    odom.header.stamp.sec = sec;
-    odom.header.stamp.nanosec = nanosec;
+    odom.header.stamp = stamp;
     odom.header.frame_id = "map";
-
-    odom.pose.pose.position.x = pub_pos.x();
-    odom.pose.pose.position.y = pub_pos.y();
-    odom.pose.pose.position.z = pub_pos.z();
-
-    // --- Robust euler -> quaternion conversion & smoothing ---
-    Eigen::AngleAxisd rx(state.euler(0), Eigen::Vector3d::UnitX());
-    Eigen::AngleAxisd ry(state.euler(1), Eigen::Vector3d::UnitY());
-    Eigen::AngleAxisd rz(state.euler(2), Eigen::Vector3d::UnitZ());
-
-    // Two candidate conventions
-    Eigen::Quaterniond q_z_y_x = rz * ry * rx; // original (Z * Y * X)
-    Eigen::Quaterniond q_x_y_z = rx * ry * rz; // alternate (X * Y * Z)
-
-    if (q_z_y_x.norm() > 0.0) q_z_y_x.normalize(); else q_z_y_x = Eigen::Quaterniond::Identity();
-    if (q_x_y_z.norm() > 0.0) q_x_y_z.normalize(); else q_x_y_z = Eigen::Quaterniond::Identity();
-
-    // choose candidate closest to previous published quaternion (handles sign ambiguity by abs(dot))
-    Eigen::Quaterniond q_pick = q_z_y_x;
-    if (have_prev_q_) {
-      double dot_z = std::abs(q_z_y_x.dot(prev_q_));
-      double dot_x = std::abs(q_x_y_z.dot(prev_q_));
-      q_pick = (dot_z >= dot_x) ? q_z_y_x : q_x_y_z;
-    } else {
-      q_pick = q_z_y_x;
-    }
-
-    // clamp / smooth large single-step rotations using slerp
-    const double MAX_ANGLE_DEG = 45.0;
-    const double MAX_ANGLE_RAD = MAX_ANGLE_DEG * M_PI / 180.0;
-    if (have_prev_q_) {
-      double raw_dot = prev_q_.dot(q_pick);
-      // handle potential numeric overshoot
-      double cosang = std::min(1.0, std::max(-1.0, raw_dot));
-      double ang = 2.0 * acos(std::abs(cosang)); // geodesic angle (use abs to handle +/- quaternion sign)
-      if (ang > MAX_ANGLE_RAD) {
-        // slerp a fraction towards new orientation to avoid immediate flips in RViz
-        double alpha = 0.15; // smoothing factor (tunable)
-        Eigen::Quaterniond q_slerp = prev_q_.slerp(alpha, q_pick);
-        if (q_slerp.norm() > 0.0) q_slerp.normalize();
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                             "Large quat jump detected (%.1f deg). Slerping alpha=%.2f", ang*180.0/M_PI, alpha);
-        q_pick = q_slerp;
-      }
-    }
-
-    // final safety normalize
-    if (q_pick.norm() <= 0.0) q_pick = Eigen::Quaterniond::Identity();
-    else q_pick.normalize();
-
-    // store prev quaternion for next frame
-    prev_q_ = q_pick;
-    have_prev_q_ = true;
-
-    // write orientation to odom
-    odom.pose.pose.orientation.x = q_pick.x();
-    odom.pose.pose.orientation.y = q_pick.y();
-    odom.pose.pose.orientation.z = q_pick.z();
-    odom.pose.pose.orientation.w = q_pick.w();
-    odom.child_frame_id = "base_link";
-
+    odom.child_frame_id  = "base_link";
+    odom.pose.pose.position.x = enu.x();
+    odom.pose.pose.position.y = enu.y();
+    odom.pose.pose.position.z = enu.z();
+    odom.pose.pose.orientation.x = q.x();
+    odom.pose.pose.orientation.y = q.y();
+    odom.pose.pose.orientation.z = q.z();
+    odom.pose.pose.orientation.w = q.w();
     odom_pub_->publish(odom);
 
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "Published odom pos=%.3f %.3f %.3f quat=%.6f %.6f %.6f %.6f (detected=%s converted=%d fallback=%d ref_z=%.3f)",
-      pub_pos.x(), pub_pos.y(), pub_pos.z(), q_pick.x(), q_pick.y(), q_pick.z(), q_pick.w(), detected.c_str(), converted?1:0, used_fallback?1:0, reference_z);
-
-    // publish TF (same pub_pos + q_pick)
-    if (tf_broadcaster_) {
+    // -------- TF（可选） --------
+    if (publish_tf_ && tf_broadcaster_) {
       geometry_msgs::msg::TransformStamped t;
-      t.header.stamp.sec = sec; t.header.stamp.nanosec = nanosec;
+      t.header.stamp = stamp;
       t.header.frame_id = "map"; t.child_frame_id = "base_link";
-      t.transform.translation.x = pub_pos.x();
-      t.transform.translation.y = pub_pos.y();
-      t.transform.translation.z = pub_pos.z();
-      t.transform.rotation.x = q_pick.x();
-      t.transform.rotation.y = q_pick.y();
-      t.transform.rotation.z = q_pick.z();
-      t.transform.rotation.w = q_pick.w();
+      t.transform.translation.x = enu.x();
+      t.transform.translation.y = enu.y();
+      t.transform.translation.z = enu.z();
+      t.transform.rotation.x = q.x();
+      t.transform.rotation.y = q.y();
+      t.transform.rotation.z = q.z();
+      t.transform.rotation.w = q.w();
       tf_broadcaster_->sendTransform(t);
     }
 
-    // Path handling (append only when not fallback and position plausible)
+    // -------- Path --------
     if (path_pub_) {
-      if (!used_fallback && publish_raw) {
-        geometry_msgs::msg::PoseStamped ps;
-        ps.header.frame_id = "map";
-        ps.header.stamp.sec = sec; ps.header.stamp.nanosec = nanosec;
-        ps.pose = odom.pose.pose;
+      geometry_msgs::msg::PoseStamped ps;
+      ps.header.frame_id = "map";
+      ps.header.stamp    = stamp;
+      ps.pose = odom.pose.pose;
 
-        // If path exists we ensure path's z stays consistent with reference_z (keeps path internal z stable)
-        if (!path_msg_.poses.empty()) {
-          ps.pose.position.z = path_msg_.poses.back().pose.position.z;
-        }
-
-        const double min_dist_xy = 0.02; // meters (XY-only)
-        const double min_dt   = 0.02; // seconds
-        bool push = false;
-        if (path_msg_.poses.empty()) push = true;
-        else {
-          auto &last = path_msg_.poses.back();
-          double dx = ps.pose.position.x - last.pose.position.x;
-          double dy = ps.pose.position.y - last.pose.position.y;
-          double dist_xy = std::sqrt(dx*dx + dy*dy);
-          uint64_t prev_ns = uint64_t(last.header.stamp.sec) * 1000000000ULL + uint64_t(last.header.stamp.nanosec);
-          uint64_t cur_ns  = uint64_t(ps.header.stamp.sec) * 1000000000ULL + uint64_t(ps.header.stamp.nanosec);
-          double dt = (cur_ns > prev_ns) ? double(cur_ns - prev_ns) * 1e-9 : 0.0;
-          if (dist_xy >= min_dist_xy || dt >= min_dt) push = true;
-        }
-        if (push) {
-          // If new point z differs hugely from last path z, clamp it instead of skipping to keep continuity
-          if (!path_msg_.poses.empty()) {
-            double last_z = path_msg_.poses.back().pose.position.z;
-            const double MAX_PATH_Z_JUMP = 100.0; // clamp jump (m)
-            double dz = ps.pose.position.z - last_z;
-            if (std::abs(dz) > MAX_PATH_Z_JUMP) {
-              double sign = (dz > 0.0) ? 1.0 : -1.0;
-              double clamped_z = last_z + sign * MAX_PATH_Z_JUMP;
-              RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "Clamping path point z from %.3f to %.3f (dz=%.3f > %g)", ps.pose.position.z, clamped_z, dz, MAX_PATH_Z_JUMP);
-              ps.pose.position.z = clamped_z;
-            }
-          }
-          path_msg_.poses.push_back(ps);
-          const size_t maxlen = 50000;
-          if (path_msg_.poses.size() > maxlen) {
-            path_msg_.poses.erase(path_msg_.poses.begin(), path_msg_.poses.begin() + (path_msg_.poses.size() - maxlen));
-          }
-          path_msg_.header.stamp.sec = sec; path_msg_.header.stamp.nanosec = nanosec;
-          path_pub_->publish(path_msg_);
-          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-            "Published path size=%zu last=(%.3f,%.3f,%.3f)",
-            path_msg_.poses.size(),
-            path_msg_.poses.back().pose.position.x,
-            path_msg_.poses.back().pose.position.y,
-            path_msg_.poses.back().pose.position.z);
-        }
-      } else {
-        RCLCPP_DEBUG(this->get_logger(), "Skipping path append due to fallback or unsafe pub_pos");
+      bool push = path_msg_.poses.empty();
+      if (!push) {
+        const auto &last = path_msg_.poses.back().pose.position;
+        const double dx = ps.pose.position.x - last.x;
+        const double dy = ps.pose.position.y - last.y;
+        const double dxy = std::sqrt(dx*dx + dy*dy);
+        if (dxy >= 0.02) push = true;
       }
-    }
-
-    if (used_fallback) {
-      RCLCPP_DEBUG(this->get_logger(), "publishState used fallback ENU (%g,%g,%g)", pub_pos.x(), pub_pos.y(), pub_pos.z());
+      if (push) {
+        if (!path_msg_.poses.empty()) {
+          auto &lastp = path_msg_.poses.back().pose.position;
+          const double dz = ps.pose.position.z - lastp.z;
+          const double MAX_PATH_Z_JUMP = 100.0;
+          if (std::abs(dz) > MAX_PATH_Z_JUMP) {
+            ps.pose.position.z = lastp.z + std::copysign(MAX_PATH_Z_JUMP, dz);
+          }
+        }
+        path_msg_.poses.push_back(ps);
+        if ((int)path_msg_.poses.size() > path_max_len_) {
+          const size_t cut = path_msg_.poses.size() - path_max_len_;
+          path_msg_.poses.erase(path_msg_.poses.begin(), path_msg_.poses.begin()+cut);
+        }
+        path_msg_.header.stamp = stamp;
+        path_pub_->publish(path_msg_);
+      }
     }
   }
 
 private:
+  // engine
   std::shared_ptr<GIEngine> engine_;
+
+  // IO
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   nav_msgs::msg::Path path_msg_;
-  rclcpp::Node::OnSetParametersCallbackHandle::SharedPtr param_sub_;
-
-  double last_imu_time_;
-  bool   imu_is_increment_{false};
-  int    imudatarate_{200};
-  std::string imu_units_{"si"};
-
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
-  // conversion helpers / fallback
-  Eigen::Vector3d init_blh_rad_{0,0,0}; // stored initial lat/lon/h in radians (h in meters)
+  // clock/imu
+  double last_imu_time_;
+  int    imudatarate_{200};
+
+  // params
+  bool   imu_is_increment_{true};
+  std::string imu_units_{"si"};
+  std::string state_pos_mode_{"enu"};
+  std::string z_strategy_{"init_alt"};
+  bool   publish_tf_{true};
+  double orientation_slerp_alpha_{0.2};
+  double clamp_xy_max_m_{5e5};
+  double clamp_z_band_m_{2000.0};
+  double smooth_z_step_m_{50.0};
+  int    path_max_len_{50000};
+
+  bool   use_dataset_time_{true};
+  double max_xy_step_m_{30.0};
+
+  // state
+  Eigen::Vector3d init_blh_rad_{0,0,0}; // [lat,lon,h] in rad,m
   Eigen::Vector3d last_valid_enu_{0,0,0};
   bool have_last_valid_{false};
 
-  // previous quaternion for smoothing / convention selection
-  Eigen::Quaterniond prev_q_ = Eigen::Quaterniond::Identity();
-  bool have_prev_q_{false};
+  Eigen::Quaterniond last_quat_{1,0,0,0};
+  bool have_last_quat_{false};
+
+  builtin_interfaces::msg::Time last_sensor_stamp_{};
 };
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<KfGinsNode>();
-  rclcpp::spin(node);
+  rclcpp::spin(std::make_shared<KfGinsNode>());
   rclcpp::shutdown();
   return 0;
 }

@@ -1,32 +1,30 @@
 kf_gins_ros2_node:
   ros__parameters:
-    imupath: "config/dataset/Leador-A15.txt"
-    gnsspath: "config/dataset/GNSS-RTK.txt"
+    # 话题（优先试 /imu/data_raw；否则 /imu/data）
+    imu_topic: "/imu/data"
+    gps_topic: "/gps/fix_cov"
 
-    outputpath: "/home/yang/KF-ROS/ros_ws/src/kf_gins_node/config/dataset"
-
-    imudatalen: 7
+    # 频率
     imudatarate: 200
 
-    starttime: 456293.0
-    endtime: -1.0
-
+    # 初值（角度单位：deg）
     initpos: [30.4447873701, 114.4718632047, 20.899]
     initvel: [0.0, 0.0, 0.0]
-    initatt: [0.0149, -0.0355, 3.24]   # 确认单位正确
+    initatt: [0.0149, -0.0355, 3.24]
 
-    initgyrbias: [0.0, 0.0, 0.0]
-    initaccbias: [0.0, 0.0, 0.0]
+    # 初始STD/IMU噪声
+    initposstd: [1.0, 1.0, 1.0]
+    initvelstd: [0.1, 0.1, 0.1]
+    initattstd: [0.1, 0.1, 0.1]
+
+    initgyrbias:  [0.0, 0.0, 0.0]   # deg/h
+    initaccbias:  [0.0, 0.0, 0.0]   # mGal
     initgyrscale: [0.0, 0.0, 0.0]
     initaccscale: [0.0, 0.0, 0.0]
 
-    initposstd: [0.005, 0.004, 0.008]
-    initvelstd: [0.003, 0.004, 0.004]
-    initattstd: [0.003, 0.003, 0.023]
-
     imunoise:
-      arw: [0.003, 0.003, 0.003]
-      vrw: [0.03, 0.03, 0.03]
+      arw:   [0.003, 0.003, 0.003]
+      vrw:   [0.03, 0.03, 0.03]
       gbstd: [0.027, 0.027, 0.027]
       abstd: [0.05, 0.05, 0.05]
       gsstd: [0.0005, 0.0005, 0.0005]
@@ -35,5 +33,18 @@ kf_gins_ros2_node:
 
     antlever: [0.136, -0.301, -0.184]
 
-    imu_is_increment: false  
+    # 固定开关（最终值）
+    imu_is_increment: false
     imu_units: "si"
+
+    # 位置解释/高度策略
+    state_pos_mode: "blh_deg"
+    z_strategy: "init_alt"
+    imu_linear_no_gravity: true
+
+    publish_tf: true
+    orientation_slerp_alpha: 0.2
+    clamp_xy_max_m: 1000.0
+    clamp_z_band_m: 2000.0
+    smooth_z_step_m: 50.0
+    path_max_len: 50000
